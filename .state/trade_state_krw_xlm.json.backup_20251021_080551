@@ -5,10 +5,10 @@
   "entry_time": 0,
   "entry_volume": 0.0,
   "entry_order_id": null,
-  "last_signal": "SELL",
-  "last_update": 1761002771.8344371,
-  "total_trades": 1,
-  "total_profit": -19999.9999995,
+  "last_signal": "HOLD",
+  "last_update": 1760979341.929884,
+  "total_trades": 0,
+  "total_profit": 0.0,
   "win_count": 0,
-  "loss_count": 1
+  "loss_count": 0
 }

@@ -15,10 +15,11 @@ from typing import List, Dict
 import threading
 
 class MultiMarketRunner:
-    def __init__(self, markets: List[str], krw_per_market: float, trading_mode: str = "DRYRUN"):
+    def __init__(self, markets: List[str], krw_per_market: float, trading_mode: str = "DRYRUN", strategy_type: str = "enhanced"):
         self.markets = markets
         self.krw_per_market = krw_per_market
         self.trading_mode = trading_mode.upper()
+        self.strategy_type = strategy_type.lower()
         self.processes = {}
         self.running = True
         
@@ -27,6 +28,7 @@ class MultiMarketRunner:
         print(f"  마켓당 금액: {krw_per_market:,}원")
         print(f"  총 투자금액: {len(markets) * krw_per_market:,}원")
         print(f"  거래 모드: {trading_mode}")
+        print(f"  전략 타입: {'🎯 Enhanced (0.2pct+ only)' if strategy_type == 'enhanced' else '⚔️ Original'}")
         print()
     
     def start_market_process(self, market: str) -> subprocess.Popen:
@@ -35,7 +37,8 @@ class MultiMarketRunner:
             sys.executable, "src/runner.py",
             "--market", market,
             "--krw", str(self.krw_per_market),
-            "--mode", self.trading_mode
+            "--mode", self.trading_mode,
+            "--strategy", self.strategy_type
         ]
         
         print(f"🚀 {market} 자동매매 시작 (PID: 대기중...)")
@@ -174,6 +177,8 @@ def main():
     parser.add_argument("--total-krw", type=float, default=100000, help="Total KRW amount (default: 100000)")
     parser.add_argument("--markets", type=str, default="KRW-BTC,KRW-ETH,KRW-XRP,KRW-SOL", help="Markets to trade (comma-separated)")
     parser.add_argument("--mode", type=str, default="DRYRUN", choices=["DRYRUN", "LIVE"], help="Trading mode")
+    parser.add_argument("--strategy", type=str, default="enhanced", choices=["enhanced", "original"], 
+                       help="Strategy type: enhanced (0.2pct+ moves only) or original")
     
     args = parser.parse_args()
     
@@ -199,7 +204,7 @@ def main():
             return
     
     # 멀티 마켓 러너 실행
-    runner = MultiMarketRunner(markets, krw_per_market, args.mode)
+    runner = MultiMarketRunner(markets, krw_per_market, args.mode, args.strategy)
     runner.run()
 
 if __name__ == "__main__":

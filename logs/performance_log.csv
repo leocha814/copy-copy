@@ -1,1 +1,2 @@
 timestamp,market,entry_strategy,entry_price,exit_price,entry_time,exit_time,profit_rate,profit_krw,hold_time,exit_reason,entry_rsi,exit_rsi,volume_ratio,slippage
+1761002119.851549,KRW-ZORA,rsi_rebound,155.0,154.0,1761002103.6718762,1761002119.851549,-0.0064516129032258064,-129.03225806451613,16.179672718048096,immediate_stop_loss,42.857142857142854,0,,0.0064516129032258064

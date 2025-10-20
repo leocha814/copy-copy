@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.upbit_api import upbit_api
 from src.trader import trader
 from src.strategy.hybrid_scalper import get_hybrid_strategy_instance, HybridScalperConfig
+from src.strategy.enhanced_hybrid_scalper import get_enhanced_strategy_instance, EnhancedHybridConfig
 from src.state_manager import StateManager
 from src.risk_manager import RiskManager
 from src.logger import logger
@@ -31,13 +32,19 @@ from src.logger import logger
 class TradingRunner:
     """자동매매 실행기"""
     
-    def __init__(self, market: str, krw_amount: float, trading_mode: str = "DRYRUN"):
+    def __init__(self, market: str, krw_amount: float, trading_mode: str = "DRYRUN", strategy_type: str = "enhanced"):
         self.market = market
         self.krw_amount = krw_amount
         self.trading_mode = trading_mode.upper()
+        self.strategy_type = strategy_type.lower()
         
-        # 컴포넌트 초기화 (하이브리드 스캘퍼, 코인별 독립적인 인스턴스)
-        self.strategy = get_hybrid_strategy_instance(self.market)
+        # 전략 선택 (개선형 vs 기존)
+        if self.strategy_type == "enhanced":
+            self.strategy = get_enhanced_strategy_instance(self.market)
+            logger.info(f"🎯 Enhanced Hybrid Scalper activated for {market}")
+        else:
+            self.strategy = get_hybrid_strategy_instance(self.market)
+            logger.info(f"⚔️ Original Hybrid Scalper activated for {market}")
         self.state_manager = StateManager(f".state/trade_state_{market.replace('-', '_').lower()}.json")
         self.risk_manager = RiskManager()
         
@@ -437,6 +444,8 @@ def main():
     parser.add_argument("--market", type=str, required=True, help="Trading market (e.g., KRW-BTC)")
     parser.add_argument("--krw", type=float, required=True, help="KRW amount per trade")
     parser.add_argument("--mode", type=str, default="DRYRUN", choices=["DRYRUN", "LIVE"], help="Trading mode")
+    parser.add_argument("--strategy", type=str, default="enhanced", choices=["enhanced", "original"], 
+                       help="Strategy type: enhanced (0.2pct+ moves only) or original")
     
     args = parser.parse_args()
     
@@ -464,7 +473,7 @@ def main():
     
     try:
         # 트레이딩 러너 초기화 및 실행
-        runner = TradingRunner(args.market, args.krw, trading_mode)
+        runner = TradingRunner(args.market, args.krw, trading_mode, args.strategy)
         runner.start()
     
     except Exception as e:
