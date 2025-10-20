@@ -124,7 +124,12 @@ class TradingRunner:
                 # 실제 거래 모드
                 result = trader.market_buy(self.market, self.krw_amount, confirm=False)
 
-                if result:
+                # 🚫 잔액 부족 시 거래 스킵
+                if result and result.get("status") == "skipped":
+                    logger.warning(f"💰 {self.market} 거래 스킵: {result.get('reason', 'unknown')}")
+                    return False
+
+                if result and result.get('uuid'):
                     # 🔍 체결 정보 확인 단계 추가
                     order_uuid = result.get('uuid')
                     executed_volume = 0
@@ -158,7 +163,10 @@ class TradingRunner:
                     return True
 
                 else:
-                    logger.error("Buy order failed")
+                    logger.error(f"🚫 {self.market} 매수 주문 실패 - 전략 상태 초기화")
+                    # 체결 실패 시 전략 상태 초기화
+                    if hasattr(self.strategy, '_reset_strategy_state'):
+                        self.strategy._reset_strategy_state()
                     return False
         
         except Exception as e:
@@ -207,9 +215,14 @@ class TradingRunner:
             
             else:
                 # 실제 거래 모드
-                result = trader.market_sell(self.market, volume, confirm=False)
+                result = trader.sell_market_order(self.market, volume)
                 
-                if result:
+                # 🚫 매도 불가 시 거래 스킵
+                if result and result.get("status") == "skipped":
+                    logger.warning(f"🚫 {self.market} 매도 스킵: {result.get('reason', 'unknown')}")
+                    return False
+                
+                if result and result.get('uuid'):
                     # 주문 성공
                     executed_price = float(result.get('price', 0)) if result.get('price') else signal_meta.get('current_price', 0)
                     exit_reason = signal_meta.get('reason', 'manual')

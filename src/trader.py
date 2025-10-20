@@ -77,8 +77,8 @@ class UpbitTrader:
         try:
             krw_balance, _ = self.get_balance('KRW')
             if krw_balance < krw_amount:
-                logger.error(f"Insufficient KRW balance. Available: {krw_balance}, Required: {krw_amount}")
-                return None
+                logger.warning(f"💰 잔액 부족 - 거래 스킵: Available: {krw_balance:.0f}원, Required: {krw_amount:.0f}원")
+                return {"status": "skipped", "reason": "insufficient_balance", "available": krw_balance, "required": krw_amount}
             
             min_amount = self.min_order_amounts.get(market, self.min_order_amounts['default'])
             if krw_amount < min_amount:
@@ -308,6 +308,10 @@ class UpbitTrader:
         except Exception as e:
             logger.error(f"Failed to get order status for {uuid}: {e}")
             return None
+    
+    def get_order(self, uuid: str) -> Optional[Dict]:
+        """주문 상태 조회 (get_order_status의 별칭)"""
+        return self.get_order_status(uuid)
 
     # 레거시 메서드 호환성 유지
     def buy_market_order(self, market: str, krw_amount: float) -> Optional[Dict]:
@@ -321,13 +325,13 @@ class UpbitTrader:
 
             # ⚠️ 안전검사 1: volume이 None이거나 0 이하인 경우
             if not volume or volume <= 0:
-                logger.warning(f"[Safety Check] 매도 수량이 0 또는 None입니다. 실시간 잔고 재확인 중... ({market})")
-                time.sleep(1.5)
-                balance, _ = self.get_balance(currency)
-                if balance <= 0:
-                    logger.error(f"[Safety Stop] 매도 가능한 {currency} 잔고가 없습니다. 주문 중단.")
-                    return None
-                volume = balance  # 실시간 잔고로 대체
+                logger.warning(f"🚫 매도 불가 - 수량 0: {market} volume={volume}")
+                return {"status": "skipped", "reason": "zero_volume", "volume": volume}
+            
+            # ⚠️ 안전검사 2: 실제 잔고 확인
+            if balance < volume:
+                logger.warning(f"🚫 매도 불가 - 잔고 부족: {market} balance={balance:.8f}, volume={volume:.8f}")
+                return {"status": "skipped", "reason": "insufficient_balance", "balance": balance, "volume": volume}
 
             # ⚠️ 안전검사 2: 너무 작은 단위의 매도 방지 (거래 최소단위 미만)
             if volume < 0.00000001:
