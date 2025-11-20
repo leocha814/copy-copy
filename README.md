@@ -1,186 +1,178 @@
-# Upbit Automated Trading System
+# Upbit Trading Bot - Mean Reversion Strategy
 
-안전한 업비트 REST API 실거래 자동매매 프로젝트입니다.
+업비트 거래소에서 동작하는 RSI + 볼린저밴드 기반 평균회귀 스캘핑 알고리즘입니다.
 
-RSI + 볼린저 밴드 되돌림 스캘핑 전략을 지원하며, 실시간 가격 모니터링과 수동/자동 거래가 가능합니다.
+## 주요 특징
 
-## 프로젝트 구조
+### 전략
+
+- **시장 상태 감지**: ADX/ATR 기반 레짐 감지 (횡보/상승추세/하락추세)
+- **평균회귀 진입**: RSI 과매도/과매수 + 볼린저밴드 이탈 조합
+- **스마트 청산**: 중간 밴드 회귀 or ATR 기반 손절/익절
+- **레짐별 분기**: 횡보장에서만 활성화, 추세장 시 일시정지
+
+### 리스크 관리
+
+- **포지션 사이징**: ATR 기반 동적 크기 조절
+- **손절/익절**: ATR의 2배/3배 자동 설정
+- **계좌 보호**: 일일 손실 한도 5%, 최대 드로우다운 15%
+- **연속 손실 제한**: 5회 연속 손실 시 자동 중단
+- **변동성 조절**: 급등 감지 시 포지션 축소
+
+### 실행 효율
+
+- **지정가 우선**: 슬리피지 최소화, 타임아웃 시 시장가 전환
+- **부분 체결 처리**: 미체결 주문 추적 및 재주문
+- **슬리피지 모니터링**: 실시간 체결 품질 추적
+
+### 모니터링
+
+- **구조적 로깅**: CSV 형식 (ts, lvl, src, sym, evt, msg, kv)
+- **텔레그램 알림**: 포지션 개시/청산, 리스크 경고, 일일 요약
+- **실시간 상태**: 계좌 잔고, 미실현손익, 연속손실 추적
+
+## 시스템 구조
 
 ```
-├── README.md                    # 프로젝트 설명서
-├── requirements.txt             # Python 의존성 패키지
-├── .env.example                # 환경변수 템플릿
-├── .env                        # 실제 API 키 (git ignore)
-├── src/
-│   ├── __init__.py
-│   ├── config.py               # 환경설정 로딩
-│   ├── upbit_api.py           # 업비트 API 래퍼 클래스
-│   ├── trader.py              # 매매 로직 구현
-│   ├── logger.py              # 로깅 설정
-│   ├── price_watcher.py       # 실시간 가격 모니터링
-│   ├── state_manager.py       # 거래 상태 관리
-│   ├── runner.py              # 자동매매 메인 실행기
-│   ├── strategy/
-│   │   ├── __init__.py
-│   │   ├── indicators.py      # 기술적 지표 (RSI, 볼린저밴드)
-│   │   └── rsi_bollinger_scalper.py  # RSI+볼린저 스캘핑 전략
-│   └── utils/
-│       ├── __init__.py
-│       └── signature.py       # JWT 서명 생성
-├── scripts/
-│   ├── check_connection.py    # API 연결 테스트
-│   ├── manual_trade.py        # 수동 거래 인터페이스
-│   ├── test_trading.py        # 거래 기능 테스트
-│   └── test_order_types.py    # 주문 타입 테스트
-├── tests/
-│   ├── __init__.py
-│   └── test_strategy.py       # 전략 단위 테스트
-├── .state/                    # 거래 상태 저장
-└── logs/                      # 로그 파일 저장소
+src/
+├── core/         # 공용 타입, 유틸, 시간/가격 변환
+├── exchange/     # CCXT 래퍼 (업비트 전용 구현)
+├── indicators/   # RSI, BB, ADX, ATR, MAs
+├── strategy/     # regime_detector, mean_reversion
+├── risk/         # risk_manager (sizing, stops, DD control)
+├── exec/         # order_router, position_tracker
+├── monitor/      # logger (CSV), alerts (Telegram)
+└── app/          # main (런처), config (.env 로딩)
 ```
 
-## 각 파일의 역할
+## 설치 및 실행
 
-### 핵심 모듈
-- **src/config.py**: .env 파일에서 API 키와 설정 로딩
-- **src/upbit_api.py**: 업비트 API 호출 래퍼 (잔고조회, 시세조회, 주문, 취소)
-- **src/trader.py**: 매수/매도 함수, 수량·가격 계산, 예외처리
-- **src/logger.py**: 파일 및 콘솔 로깅 설정
-- **src/price_watcher.py**: 실시간 가격 모니터링 (1초 주기)
-- **src/state_manager.py**: 거래 상태 및 포지션 관리
-- **src/runner.py**: 자동매매 메인 실행기
+### 1. 의존성 설치
 
-### 전략 모듈
-- **src/strategy/indicators.py**: 기술적 지표 계산 (RSI, 볼린저 밴드)
-- **src/strategy/rsi_bollinger_scalper.py**: RSI + 볼린저 되돌림 스캘핑 전략
-
-### 유틸리티
-- **src/utils/signature.py**: JWT 토큰 서명 생성 로직
-
-### 스크립트
-- **scripts/check_connection.py**: API 연결 및 기본 기능 테스트
-- **scripts/manual_trade.py**: 콘솔 기반 수동 거래 인터페이스
-- **scripts/test_trading.py**: 거래 기능 종합 테스트
-- **scripts/test_order_types.py**: 주문 타입별 파라미터 테스트
-
-### 테스트
-- **tests/test_strategy.py**: 스캘핑 전략 단위 테스트
-
-## 설치 및 설정
-
-1. 의존성 설치:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 환경변수 설정:
+### 2. 환경 설정
+
 ```bash
 cp .env.example .env
-# .env 파일을 편집하여 업비트 API 키 입력
+# .env 파일을 열어 UPBIT_API_KEY와 UPBIT_API_SECRET 입력
 ```
 
-3. API 연결 테스트:
+### 3. 실행
+
 ```bash
-python scripts/check_connection.py
+python -m src.app.main
 ```
 
-## 사용법
+## 환경 변수 설정
 
-### 1. 수동 거래 (실시간 모니터링 + 콘솔 주문)
-```bash
-python scripts/manual_trade.py
+`.env` 파일에서 다음 파라미터를 조정할 수 있습니다:
+
+### 필수 설정
+
+- `UPBIT_API_KEY`: 업비트 API 키
+- `UPBIT_API_SECRET`: 업비트 API 시크릿
+
+### 전략 파라미터
+
+- `TRADING_SYMBOLS`: 거래 심볼 (쉼표 구분, 예: BTC/KRW,ETH/KRW)
+- `TIMEFRAME`: 캔들 타임프레임 (1m, 5m, 15m, 1h 등)
+- `RSI_PERIOD`: RSI 계산 기간 (기본: 14)
+- `RSI_OVERSOLD`: RSI 과매도 기준 (기본: 30)
+- `RSI_OVERBOUGHT`: RSI 과매수 기준 (기본: 70)
+- `BB_PERIOD`: 볼린저밴드 기간 (기본: 20)
+- `BB_STD_DEV`: 볼린저밴드 표준편차 배수 (기본: 2.0)
+- `ADX_THRESHOLD_LOW`: 횡보장 판단 ADX 하한 (기본: 20)
+- `ADX_THRESHOLD_HIGH`: 추세장 판단 ADX 상한 (기본: 25)
+
+### 리스크 파라미터
+
+- `PER_TRADE_RISK`: 거래당 리스크 % (기본: 2.0)
+- `MAX_DAILY_LOSS`: 일일 최대 손실 % (기본: 5.0)
+- `MAX_CONSECUTIVE_LOSSES`: 최대 연속 손실 횟수 (기본: 5)
+- `MAX_DRAWDOWN`: 최대 드로우다운 % (기본: 15.0)
+- `STOP_ATR_MULTIPLIER`: 손절 ATR 배수 (기본: 2.0)
+- `TARGET_ATR_MULTIPLIER`: 익절 ATR 배수 (기본: 3.0)
+
+### 텔레그램 알림 (선택사항)
+
+- `TELEGRAM_BOT_TOKEN`: 텔레그램 봇 토큰
+- `TELEGRAM_CHAT_ID`: 텔레그램 채팅 ID
+
+## 안전 수칙
+
+### ⚠️ 실전 운용 전 필수 체크리스트
+
+1. **백테스트 수행**: 다양한 시장 상황에서 전략 검증
+2. **소액 테스트**: 최소 금액으로 실전 테스트
+3. **API 권한 제한**: 출금 권한 비활성화
+4. **모니터링 체계**: 텔레그램 알림 설정
+5. **리스크 한도 확인**: 일일 손실 한도 및 드로우다운 설정
+6. **네트워크 안정성**: 안정적인 인터넷 연결 확보
+
+### 🚨 주의사항
+
+- **절대 실제 자금 전액 투입 금지**: 손실 감내 가능한 금액만 사용
+- **API 키 보안**: .env 파일을 절대 공개 저장소에 커밋하지 말 것
+- **시장 급변 대응**: 중요 경제 지표 발표 시 알고리즘 일시정지 고려
+- **주기적 점검**: 전략 성과를 정기적으로 리뷰하고 파라미터 조정
+- **슬리피지 모니터링**: 슬리피지가 과도하면 거래 규모 축소
+
+## 로그 분석
+
+로그는 `logs/` 디렉토리에 CSV 형식으로 저장됩니다.
+
+### 로그 형식
+
+```csv
+ts,lvl,src,sym,evt,msg,kv
+2024-01-01T12:00:00Z,INFO,strategy,BTC/KRW,signal,"Long signal: RSI=25",{"rsi":25,"bb_pos":-120}
 ```
 
-사용 가능한 명령어:
-- `buy BTC 50000 market` - BTC 50,000원 시장가 매수
-- `buy ETH 0.1 100000` - ETH 0.1개 100,000원 지정가 매수  
-- `sell BTC 0.001 market` - BTC 0.001개 시장가 매도
-- `sell ETH 0.1 150000` - ETH 0.1개 150,000원 지정가 매도
-- `cancel [UUID]` - 주문 취소
-- `balance` - 잔고 조회
-- `orders` - 미체결 주문 조회
-
-### 2. 자동매매 (RSI + 볼린저 스캘핑)
-
-#### DRYRUN 모드 (시뮬레이션, 권장)
-```bash
-python src/runner.py --market KRW-BTC --krw 10000 --mode DRYRUN
-```
-
-#### LIVE 모드 (실거래, 주의!)
-```bash
-python src/runner.py --market KRW-ETH --krw 5000 --mode LIVE
-```
-
-#### 환경변수로 모드 설정
-```bash
-export TRADING_MODE=DRYRUN
-python src/runner.py --market KRW-BTC --krw 10000
-```
-
-### 3. 전략 설정 커스터마이징
+### Python으로 로그 분석
 
 ```python
-from src.strategy.rsi_bollinger_scalper import ScalperConfig, RSIBollingerScalper
+import pandas as pd
 
-# 커스텀 설정
-config = ScalperConfig(
-    rsi_window=14,           # RSI 계산 기간
-    bb_window=20,            # 볼린저 밴드 기간  
-    bb_std=2.0,              # 볼린저 밴드 표준편차 배수
-    rsi_oversold=30.0,       # RSI 과매도 기준
-    take_profit=0.005,       # 익절 기준 (0.5%)
-    stop_loss=-0.004,        # 손절 기준 (-0.4%)
-    max_hold_sec=300,        # 최대 보유시간 (5분)
-    use_ranging_filter=True  # 횡보 필터 사용
-)
+# 로그 읽기
+df = pd.read_csv('logs/trading_20240101.csv')
 
-strategy = RSIBollingerScalper(config)
+# 신호 필터링
+signals = df[df['evt'] == 'signal']
+
+# 거래 통계
+trades = df[df['evt'] == 'trade_closed']
+print(f"Total trades: {len(trades)}")
+print(f"Win rate: {(trades['msg'].str.contains('PnL: [0-9]+\\.').sum() / len(trades)) * 100:.1f}%")
 ```
 
-## 전략 개요
+## 개발 및 커스터마이징
 
-### RSI + 볼린저 되돌림 스캘핑
-- **목표**: 횡보장에서 짧은 시간 내 여러 번 진입/청산
-- **진입 조건**: 가격이 볼린저 하단 하향 이탈 AND RSI < 30
-- **청산 조건**: +0.5% 익절 OR -0.4% 손절 OR 보유 5분 경과
-- **필터**: RSI 40~60 범위일 때만 활성화 (횡보 구간)
+### 새로운 지표 추가
 
-### 안전장치
-- **기본 DRYRUN 모드**: 실제 주문 없이 시뮬레이션
-- **API 레이트 리밋 준수**: 최소 1초 주기 실행
-- **포지션 1개 제한**: 중복 진입 방지
-- **쿨다운**: 주문 후 10초 대기
-- **에러 핸들링**: 재시도 전 백오프 지연
+`src/indicators/indicators.py`에 순수 함수로 구현:
 
-## 테스트
-
-### 전략 단위 테스트
-```bash
-python tests/test_strategy.py
+```python
+def calculate_my_indicator(prices: List[float], period: int) -> np.ndarray:
+    # 구현
+    return result
 ```
 
-### 거래 기능 테스트
-```bash
-python scripts/test_trading.py
-python scripts/test_order_types.py
-```
+### 전략 수정
 
-## 로그 및 상태 관리
+`src/strategy/mean_reversion.py`의 `generate_entry_signal()` 메서드 수정
 
-- **거래 로그**: `logs/orders.log` - 모든 주문 기록
-- **일반 로그**: `logs/trading_YYYYMMDD.log` - 일반 로그
-- **상태 파일**: `.state/trade_state_krw_btc.json` - 포지션 상태 저장
+### 리스크 규칙 조정
 
-## 보안 주의사항
+`src/risk/risk_manager.py`에서 한도 체크 로직 수정
 
-- API 키는 절대 코드에 직접 포함하지 마세요
-- .env 파일을 git에 커밋하지 마세요
-- DRYRUN으로 충분히 테스트 후 LIVE 모드 사용
-- 최소 주문단위와 잔고를 항상 확인하세요
-- 실거래 시 소액으로 시작하세요
+## 라이선스
 
-## 면책조항
+이 프로젝트는 교육 및 연구 목적으로 제공됩니다.
+실제 거래에서 발생하는 손실에 대해 개발자는 책임지지 않습니다.
 
-이 프로젝트는 교육 목적으로 제공됩니다. 실거래 사용 시 발생하는 손실에 대해 책임지지 않습니다.
-자동매매는 높은 위험을 수반하므로 충분한 이해와 테스트 후 사용하시기 바랍니다.
+## 문의 및 기여
+
+이슈 및 개선 제안은 GitHub Issues를 통해 제출해주세요.
