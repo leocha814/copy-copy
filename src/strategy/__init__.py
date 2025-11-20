@@ -1,5 +1,5 @@
 """Strategy module exports."""
-from src.strategy.regime_detector import RegimeDetector
-from src.strategy.mean_reversion import MeanReversionStrategy
+from src.strategy.fast_regime_detector import FastRegimeDetector
+from src.strategy.scalping_strategy import ScalpingStrategy
 
-__all__ = ['RegimeDetector', 'MeanReversionStrategy']
+__all__ = ["FastRegimeDetector", "ScalpingStrategy"]

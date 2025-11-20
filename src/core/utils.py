@@ -127,7 +127,10 @@ def round_to_precision(value, precision):
     """
     value: float
     precision: 소수 자리수 (int처럼 쓸 수 있는 값)
+    주문 수량은 내림(floor)으로 처리해서 반올림으로 인한 초과 주문 방지
     """
+    import math
+    
     if precision is None:
         return float(value)
 
@@ -140,7 +143,9 @@ def round_to_precision(value, precision):
         )
         return float(value)
 
-    return round(float(value), p)
+    # 내림(floor)으로 처리: 반올림으로 인한 초과 주문 방지
+    multiplier = 10 ** p
+    return math.floor(float(value) * multiplier) / multiplier
 
 
 def clamp(value: float, min_val: float, max_val: float) -> float:

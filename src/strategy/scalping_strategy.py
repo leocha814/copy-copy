@@ -10,7 +10,7 @@ Characteristics:
 """
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -37,9 +37,10 @@ def _is_bad_number(val) -> bool:
 
 
 def _ensure_utc(dt: datetime) -> datetime:
+    """Return timezone-aware UTC datetime."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=None)
-    return dt
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _to_datetime_from_ts(ts) -> Optional[datetime]:
@@ -80,9 +81,11 @@ class ScalpingStrategy:
         self,
         # Indicator parameters
         rsi_period: int = 14,
-        rsi_entry_low: float = 40.0,
-        rsi_entry_high: float = 60.0,
+        rsi_entry_low: float = 35.0,  # Relaxed from 40 to 35
+        rsi_entry_high: float = 65.0,  # Relaxed from 60 to 65
         rsi_exit_neutral: float = 50.0,
+        rsi_oversold: float = 30.0,  # NEW: For downtrend bounce
+        rsi_overbought: float = 70.0,  # NEW: For ranging exit
         bb_period: int = 20,
         bb_std_dev: float = 2.0,
         ema_fast_period: int = 9,
@@ -91,19 +94,24 @@ class ScalpingStrategy:
         cooldown_seconds: int = 20,
         bb_width_min: float = 0.3,
         bb_width_max: float = 15.0,
-        # Fixed stops (percentage)
-        fixed_stop_loss_pct: float = 0.15,
-        fixed_take_profit_pct: float = 0.25,
+        # Fixed stops (percentage) - IMPROVED
+        fixed_stop_loss_pct: float = 0.20,  # Increased from 0.15
+        fixed_take_profit_pct: float = 0.35,  # Increased from 0.25
+        # Downtrend bounce scalping (tighter stops)
+        downtrend_stop_loss_pct: float = 0.15,  # NEW: Tighter SL for counter-trend
+        downtrend_take_profit_pct: float = 0.20,  # NEW: Faster TP for bounces
         time_stop_minutes: int = 5,
         # Regime-specific flags
         enable_uptrend_longs: bool = True,
-        enable_downtrend_shorts: bool = True,
+        enable_downtrend_bounce_longs: bool = True,  # NEW: Renamed from shorts
         enable_ranging_both: bool = True,
     ):
         self.rsi_period = rsi_period
         self.rsi_entry_low = rsi_entry_low
         self.rsi_entry_high = rsi_entry_high
         self.rsi_exit_neutral = rsi_exit_neutral
+        self.rsi_oversold = rsi_oversold
+        self.rsi_overbought = rsi_overbought
         self.bb_period = bb_period
         self.bb_std_dev = bb_std_dev
         self.ema_fast_period = ema_fast_period
@@ -115,10 +123,12 @@ class ScalpingStrategy:
 
         self.fixed_stop_loss_pct = fixed_stop_loss_pct
         self.fixed_take_profit_pct = fixed_take_profit_pct
+        self.downtrend_stop_loss_pct = downtrend_stop_loss_pct
+        self.downtrend_take_profit_pct = downtrend_take_profit_pct
         self.time_stop_minutes = time_stop_minutes
 
         self.enable_uptrend_longs = enable_uptrend_longs
-        self.enable_downtrend_shorts = enable_downtrend_shorts
+        self.enable_downtrend_bounce_longs = enable_downtrend_bounce_longs
         self.enable_ranging_both = enable_ranging_both
 
         # Track last signal time per symbol
@@ -267,7 +277,7 @@ class ScalpingStrategy:
             elapsed = (_ensure_utc(now_like) - _ensure_utc(last_time)).total_seconds()
             if elapsed < self.cooldown_seconds:
                 logger.debug(
-                    f"[{symbol}][SCALP] Cooldown: {elapsed:.0f}s < {self.cooldown_seconds}s"
+                    f"[{symbol}] 쿨다운 진행 중: {elapsed:.0f}s/{self.cooldown_seconds}s"
                 )
                 return None
 
@@ -299,26 +309,35 @@ class ScalpingStrategy:
         # BB width filter
         if bb_width_pct < self.bb_width_min:
             logger.debug(
-                f"[{symbol}][SCALP] BB too narrow: {bb_width_pct:.2f}% < {self.bb_width_min}%"
+                f"[{symbol}] 밴드 폭 좁음: {bb_width_pct:.2f}% < {self.bb_width_min}%"
             )
             return None
         if bb_width_pct > self.bb_width_max:
             logger.debug(
-                f"[{symbol}][SCALP] BB too wide: {bb_width_pct:.2f}% > {self.bb_width_max}%"
+                f"[{symbol}] 밴드 폭 넓음: {bb_width_pct:.2f}% > {self.bb_width_max}%"
             )
             return None
+
+        logger.debug(
+            f"[{symbol}] 지표: RSI={rsi:.1f}, BB폭={bb_width_pct:.2f}%, "
+            f"BB포지션={bb_position if bb_position is not None else 'N/A'}, "
+            f"EMA_fast={ema_fast:.2f}, EMA_slow={ema_slow:.2f}, 가격={current_price:.2f}"
+        )
 
         # ===== Regime-based entry logic =====
 
         signal: Optional[Signal] = None
 
-        # UPTREND: Buy dips
+        # UPTREND: Buy dips (IMPROVED - relaxed conditions)
         if regime == MarketRegime.UPTREND and self.enable_uptrend_longs:
-            # Entry: Price near EMA fast/slow, RSI 40-50 (not oversold, just pullback)
-            near_ema = (current_price <= ema_fast * 1.002) or (current_price >= ema_slow * 0.998)
-            rsi_pullback = self.rsi_entry_low <= rsi <= self.rsi_exit_neutral
+            # Entry: Price near EMA_fast (within ±0.5%), RSI 35-55 (relaxed)
+            near_ema_fast = 0.995 <= (current_price / ema_fast) <= 1.005
+            rsi_pullback = self.rsi_entry_low <= rsi <= 55.0  # Extended to 55
 
-            if ema_trend == 1 and near_ema and rsi_pullback:
+            logger.debug(
+                f"[{symbol}] 상승장 조건 | 가격/EMA근접={near_ema_fast}, RSI범위={rsi_pullback}"
+            )
+            if ema_trend == 1 and near_ema_fast and rsi_pullback:
                 reason = (
                     f"SCALP LONG (UPTREND): pullback to EMA, "
                     f"price={current_price:.2f}, EMA_fast={ema_fast:.2f}, "
@@ -334,35 +353,25 @@ class ScalpingStrategy:
                     executed=False,
                 )
 
-        # DOWNTREND: Sell rallies
-        elif regime == MarketRegime.DOWNTREND and self.enable_downtrend_shorts:
-            # Entry: Price near EMA fast/slow, RSI 50-60 (not overbought, just bounce)
-            near_ema = (current_price >= ema_fast * 0.998) or (current_price <= ema_slow * 1.002)
-            rsi_bounce = self.rsi_exit_neutral <= rsi <= self.rsi_entry_high
+        # DOWNTREND: Counter-trend bounce scalping (LONG on oversold bounce)
+        # NOTE: Upbit doesn't support SHORT, so we trade bounces instead
+        elif regime == MarketRegime.DOWNTREND and self.enable_downtrend_bounce_longs:
+            # Entry: Oversold bounce (RSI < 30, BB lower band touch)
+            oversold_bounce = rsi <= self.rsi_oversold
+            at_bb_lower = bb_position is not None and bb_position < -40
+            
+            # Additional safety: require some bounce momentum (price slightly above BB lower)
+            bounce_started = current_price > bb_lower * 1.001
 
-            if ema_trend == -1 and near_ema and rsi_bounce:
-                reason = (
-                    f"SCALP SHORT (DOWNTREND): bounce to EMA, "
-                    f"price={current_price:.2f}, EMA_fast={ema_fast:.2f}, "
-                    f"RSI={rsi:.1f}"
-                )
-                signal = Signal(
-                    timestamp=now_like,
-                    symbol=symbol,
-                    side=OrderSide.SELL,
-                    reason=reason,
-                    regime=regime,
-                    indicators=ind,
-                    executed=False,
-                )
+            logger.debug(
+                f"[{symbol}] 하락장 바운스 조건 | RSI과매도={oversold_bounce}, "
+                f"BB하단접근={at_bb_lower}, 반등시작={bounce_started}"
+            )
 
-        # RANGING: Mean reversion
-        elif regime == MarketRegime.RANGING and self.enable_ranging_both:
-            # LONG: Price near BB lower, RSI < 50
-            if bb_position is not None and bb_position < -30 and rsi < self.rsi_exit_neutral:
+            if ema_trend == -1 and oversold_bounce and at_bb_lower and bounce_started:
                 reason = (
-                    f"SCALP LONG (RANGING): mean reversion, "
-                    f"price={current_price:.2f} < BB_lower={bb_lower:.2f}, "
+                    f"SCALP LONG (DOWNTREND BOUNCE): oversold reversal, "
+                    f"price={current_price:.2f}, BB_lower={bb_lower:.2f}, "
                     f"RSI={rsi:.1f}, BB_pos={bb_position:.1f}"
                 )
                 signal = Signal(
@@ -375,25 +384,39 @@ class ScalpingStrategy:
                     executed=False,
                 )
 
-            # SHORT: Price near BB upper, RSI > 50
-            elif bb_position is not None and bb_position > 30 and rsi > self.rsi_exit_neutral:
+        # RANGING: Mean reversion (IMPROVED - relaxed conditions, LONG only)
+        elif regime == MarketRegime.RANGING and self.enable_ranging_both:
+            bb_pos_dbg = f"{bb_position:.1f}" if bb_position is not None else "N/A"
+            logger.debug(
+                f"[{symbol}] 횡보 조건 | BB포지션={bb_pos_dbg}, RSI={rsi:.1f}"
+            )
+            # LONG: Price in lower half of BB, RSI < 55 (더 관대한 조건)
+            # bb_position: -100(lower) ~ +100(upper), 0=middle
+            lower_half = bb_position is not None and bb_position < 20  # Relaxed to include more of lower half
+            rsi_favorable = rsi < 55  # Relaxed from 50 to 55
+            
+            if lower_half and rsi_favorable:
                 reason = (
-                    f"SCALP SHORT (RANGING): mean reversion, "
-                    f"price={current_price:.2f} > BB_upper={bb_upper:.2f}, "
+                    f"SCALP LONG (RANGING): mean reversion, "
+                    f"price={current_price:.2f}, BB_lower={bb_lower:.2f}, BB_middle={bb_middle:.2f}, "
                     f"RSI={rsi:.1f}, BB_pos={bb_position:.1f}"
                 )
                 signal = Signal(
                     timestamp=now_like,
                     symbol=symbol,
-                    side=OrderSide.SELL,
+                    side=OrderSide.BUY,
                     reason=reason,
                     regime=regime,
                     indicators=ind,
                     executed=False,
                 )
 
+            # NOTE: BB upper SHORT removed (Upbit doesn't support SHORT)
+            # Instead, this will be handled in exit logic:
+            # - If we have a LONG position and price hits BB upper, we exit for profit
+
         if signal is not None:
-            logger.info(f"[{symbol}][SCALP] Signal generated: {signal.reason}")
+            logger.info(f"[{symbol}] 신호 발생: {signal.reason}")
             self.last_signal_time[symbol] = _ensure_utc(now_like)
 
         return signal
@@ -408,13 +431,16 @@ class ScalpingStrategy:
         entry_time: datetime,
         *,
         entry_bar_index: Optional[int] = None,
+        regime: Optional[MarketRegime] = None,
     ) -> Tuple[bool, str]:
         """
-        Fast exit logic for scalping:
-        1. Fixed TP: +0.25%
-        2. Fixed SL: -0.15%
-        3. Time stop: 5 minutes
-        4. Quick reversal signals
+        Improved exit logic for scalping:
+        1. Fixed TP: +0.35% (improved from 0.25%)
+        2. Fixed SL: -0.20% (improved from 0.15%)
+        3. Downtrend bounce TP: +0.20% (faster exit for counter-trend)
+        4. Downtrend bounce SL: -0.15% (tighter stop for counter-trend)
+        5. Quick reversal signals (RSI + BB)
+        6. BB upper band exit (for ranging/profit-taking)
         """
         need = max(self.rsi_period, self.bb_period) + 2
         if len(candles) < need:
@@ -435,48 +461,71 @@ class ScalpingStrategy:
         else:  # SELL
             pnl_pct = ((entry_price - current_price) / entry_price) * 100.0
 
+        # Determine stop/target levels based on regime
+        # DOWNTREND bounces use tighter stops (counter-trend = riskier)
+        if regime == MarketRegime.DOWNTREND:
+            stop_loss_pct = self.downtrend_stop_loss_pct
+            take_profit_pct = self.downtrend_take_profit_pct
+        else:
+            stop_loss_pct = self.fixed_stop_loss_pct
+            take_profit_pct = self.fixed_take_profit_pct
+
         # 1) Fixed TP
-        if pnl_pct >= self.fixed_take_profit_pct:
-            return True, f"TP hit: +{pnl_pct:.2f}% >= +{self.fixed_take_profit_pct}%"
+        if pnl_pct >= take_profit_pct:
+            return True, f"TP hit: +{pnl_pct:.2f}% >= +{take_profit_pct}%"
 
         # 2) Fixed SL
-        if pnl_pct <= -self.fixed_stop_loss_pct:
-            return True, f"SL hit: {pnl_pct:.2f}% <= -{self.fixed_stop_loss_pct}%"
+        if pnl_pct <= -stop_loss_pct:
+            return True, f"SL hit: {pnl_pct:.2f}% <= -{stop_loss_pct}%"
 
-        # 3) Time stop
-        now_like = self._last_candle_time(candles)
-        time_held = (_ensure_utc(now_like) - _ensure_utc(entry_time)).total_seconds()
-        time_limit = self.time_stop_minutes * 60
-        if time_held >= time_limit:
-            return True, f"Time stop: held {time_held:.0f}s >= {time_limit}s (PnL: {pnl_pct:.2f}%)"
-
-        # 4) Quick reversal signals (optional, fast exit)
+        # 3) Quick reversal signals + BB band exits
         try:
             rsi = calculate_rsi(close_prices, self.rsi_period)
-            _, bb_middle, _ = calculate_bollinger_bands(
+            bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(
                 close_prices, self.bb_period, self.bb_std_dev
             )
         except Exception:
             return False, ""
 
-        if rsi is None or bb_middle is None or len(rsi) == 0 or len(bb_middle) == 0:
+        if (rsi is None or bb_middle is None or bb_upper is None or bb_lower is None or
+            len(rsi) == 0 or len(bb_middle) == 0 or len(bb_upper) == 0 or len(bb_lower) == 0):
             return False, ""
 
         current_rsi = float(rsi[-1])
         current_bb_middle = float(bb_middle[-1])
+        current_bb_upper = float(bb_upper[-1])
+        current_bb_lower = float(bb_lower[-1])
 
-        if _is_bad_number(current_rsi) or _is_bad_number(current_bb_middle):
+        if any(_is_bad_number(v) for v in [current_rsi, current_bb_middle, current_bb_upper, current_bb_lower]):
             return False, ""
 
-        # LONG: Exit if RSI crosses above neutral or price above BB middle
-        if entry_side == OrderSide.BUY:
-            if current_rsi > self.rsi_exit_neutral and current_price >= current_bb_middle:
-                return True, f"LONG quick exit: RSI={current_rsi:.1f} > {self.rsi_exit_neutral}, price above BB_mid"
+        # Calculate BB position
+        try:
+            bb_position = calculate_bb_position(
+                current_price, current_bb_upper, current_bb_middle, current_bb_lower
+            )
+            if _is_bad_number(bb_position):
+                bb_position = None
+            else:
+                bb_position = float(bb_position)
+        except Exception:
+            bb_position = None
 
-        # SHORT: Exit if RSI crosses below neutral or price below BB middle
-        if entry_side == OrderSide.SELL:
-            if current_rsi < self.rsi_exit_neutral and current_price <= current_bb_middle:
-                return True, f"SHORT quick exit: RSI={current_rsi:.1f} < {self.rsi_exit_neutral}, price below BB_mid"
+        # LONG exits only (we don't have SHORT positions)
+        if entry_side == OrderSide.BUY:
+            # A) BB upper band exit (profit-taking in ranging/uptrend)
+            if bb_position is not None and bb_position > 40 and current_rsi > 60:
+                return True, f"BB upper exit: price near BB_upper, RSI={current_rsi:.1f}, BB_pos={bb_position:.1f}"
+            
+            # B) Overbought exit (quick profit in strong move)
+            if current_rsi >= self.rsi_overbought and pnl_pct > 0:
+                return True, f"Overbought exit: RSI={current_rsi:.1f} >= {self.rsi_overbought}, PnL={pnl_pct:.2f}%"
+            
+            # C) BB middle reversion (for ranging trades)
+            if regime == MarketRegime.RANGING and current_price >= current_bb_middle and current_rsi > self.rsi_exit_neutral:
+                return True, f"RANGING mean reversion: price={current_price:.2f} >= BB_mid={current_bb_middle:.2f}, RSI={current_rsi:.1f}"
+
+        # Note: SELL side removed (no SHORT positions on Upbit)
 
         return False, ""
 

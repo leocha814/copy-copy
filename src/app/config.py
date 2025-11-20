@@ -40,29 +40,33 @@ class StrategyConfig:
     atr_period: int = 14
 
     # Scalping parameters
-    entry_cooldown_seconds: int = 20
-    bb_width_min: float = 0.3
+    entry_cooldown_seconds: int = 15
+    bb_width_min: float = 0.2
     bb_width_max: float = 15.0
     time_stop_minutes: int = 5
 
     # Trading symbols
     symbols: List[str] = None
-    timeframe: str = '5m'
+    timeframe: str = '1m'
 
 
 @dataclass
 class RiskConfig:
     """Risk management parameters."""
-    per_trade_risk_pct: float = 2.0
-    max_daily_loss_pct: float = 5.0
-    max_consecutive_losses: int = 5
-    max_drawdown_pct: float = 15.0
-    max_position_size_pct: float = 50.0
+    per_trade_risk_pct: float = 0.5
+    max_daily_loss_pct: float = 10.0
+    max_consecutive_losses: int = 3
+    max_drawdown_pct: float = 5.0
+    max_position_size_pct: float = 30.0
 
     # Fixed stops for scalping
-    use_fixed_stops: bool = False
-    fixed_stop_loss_pct: float = 0.15
-    fixed_take_profit_pct: float = 0.25
+    use_fixed_stops: bool = True
+    fixed_stop_loss_pct: float = 0.18
+    fixed_take_profit_pct: float = 0.30
+
+    # Downtrend bounce (counter-trend) stops
+    downtrend_stop_loss_pct: float = 0.15
+    downtrend_take_profit_pct: float = 0.20
 
     # ATR-based stops (fallback)
     stop_atr_multiplier: float = 2.0
@@ -139,13 +143,13 @@ def load_config() -> TradingConfig:
     )
 
     # Strategy config
-    symbols_str = os.getenv('TRADING_SYMBOLS', 'BTC/KRW,ETH/KRW,XRP/KRW')
+    symbols_str = os.getenv('TRADING_SYMBOLS', 'BTC/KRW')
     symbols = [s.strip() for s in symbols_str.split(',')]
 
     strategy_config = StrategyConfig(
         rsi_period=int(os.getenv('RSI_PERIOD', '14')),
-        rsi_oversold=float(os.getenv('RSI_OVERSOLD', '30')),
-        rsi_overbought=float(os.getenv('RSI_OVERBOUGHT', '70')),
+        rsi_oversold=float(os.getenv('RSI_OVERSOLD', '35')),
+        rsi_overbought=float(os.getenv('RSI_OVERBOUGHT', '65')),
         rsi_exit_neutral=float(os.getenv('RSI_EXIT_NEUTRAL', '50')),
         bb_period=int(os.getenv('BB_PERIOD', '20')),
         bb_std_dev=float(os.getenv('BB_STD_DEV', '2.0')),
@@ -153,24 +157,26 @@ def load_config() -> TradingConfig:
         adx_threshold_high=float(os.getenv('ADX_THRESHOLD_HIGH', '25')),
         adx_period=int(os.getenv('ADX_PERIOD', '14')),
         atr_period=int(os.getenv('ATR_PERIOD', '14')),
-        entry_cooldown_seconds=int(os.getenv('ENTRY_COOLDOWN_SECONDS', '20')),
-        bb_width_min=float(os.getenv('BB_WIDTH_MIN', '0.3')),
+        entry_cooldown_seconds=int(os.getenv('ENTRY_COOLDOWN_SECONDS', '15')),
+        bb_width_min=float(os.getenv('BB_WIDTH_MIN', '0.2')),
         bb_width_max=float(os.getenv('BB_WIDTH_MAX', '15.0')),
         time_stop_minutes=int(os.getenv('TIME_STOP_MINUTES', '5')),
         symbols=symbols,
-        timeframe=os.getenv('TIMEFRAME', '5m')
+        timeframe=os.getenv('TIMEFRAME', '1m')
     )
 
     # Risk config
     risk_config = RiskConfig(
         per_trade_risk_pct=float(os.getenv('PER_TRADE_RISK', '2.0')),
-        max_daily_loss_pct=float(os.getenv('MAX_DAILY_LOSS', '5.0')),
-        max_consecutive_losses=int(os.getenv('MAX_CONSECUTIVE_LOSSES', '5')),
-        max_drawdown_pct=float(os.getenv('MAX_DRAWDOWN', '15.0')),
-        max_position_size_pct=float(os.getenv('MAX_POSITION_SIZE', '50.0')),
-        use_fixed_stops=os.getenv('USE_FIXED_STOPS', 'false').lower() == 'true',
-        fixed_stop_loss_pct=float(os.getenv('FIXED_STOP_LOSS_PCT', '0.15')),
-        fixed_take_profit_pct=float(os.getenv('FIXED_TAKE_PROFIT_PCT', '0.25')),
+        max_daily_loss_pct=float(os.getenv('MAX_DAILY_LOSS', '10.0')),
+        max_consecutive_losses=int(os.getenv('MAX_CONSECUTIVE_LOSSES', '3')),
+        max_drawdown_pct=float(os.getenv('MAX_DRAWDOWN', '5.0')),
+        max_position_size_pct=float(os.getenv('MAX_POSITION_SIZE', '30.0')),
+        use_fixed_stops=os.getenv('USE_FIXED_STOPS', 'true').lower() == 'true',
+        fixed_stop_loss_pct=float(os.getenv('FIXED_STOP_LOSS_PCT', '0.18')),
+        fixed_take_profit_pct=float(os.getenv('FIXED_TAKE_PROFIT_PCT', '0.30')),
+        downtrend_stop_loss_pct=float(os.getenv('DOWNTREND_STOP_LOSS_PCT', '0.15')),
+        downtrend_take_profit_pct=float(os.getenv('DOWNTREND_TAKE_PROFIT_PCT', '0.20')),
         stop_atr_multiplier=float(os.getenv('FALLBACK_STOP_ATR_MULTIPLIER', '2.0')),
         target_atr_multiplier=float(os.getenv('FALLBACK_TARGET_ATR_MULTIPLIER', '3.0'))
     )
@@ -294,8 +300,8 @@ def validate_risk_config(config: RiskConfig) -> None:
     errors = []
     
     # Percentage validations
-    if not (0.1 <= config.per_trade_risk_pct <= 10.0):
-        errors.append(f"PER_TRADE_RISK must be between 0.1-10.0%, got {config.per_trade_risk_pct}%")
+    if not (0.1 <= config.per_trade_risk_pct <= 100.0):
+        errors.append(f"PER_TRADE_RISK must be between 0.1-100.0%, got {config.per_trade_risk_pct}%")
     if not (1.0 <= config.max_daily_loss_pct <= 50.0):
         errors.append(f"MAX_DAILY_LOSS must be between 1.0-50.0%, got {config.max_daily_loss_pct}%")
     if not (5.0 <= config.max_drawdown_pct <= 100.0):
@@ -315,8 +321,8 @@ def validate_risk_config(config: RiskConfig) -> None:
     if config.target_atr_multiplier <= config.stop_atr_multiplier:
         errors.append(f"TARGET_ATR_MULTIPLIER ({config.target_atr_multiplier}) must be > STOP_ATR_MULTIPLIER ({config.stop_atr_multiplier})")
     
-    # Logical validations
-    if config.per_trade_risk_pct > config.max_daily_loss_pct:
+    # Logical validations (skip for full-in mode: PER_TRADE_RISK=100%)
+    if config.per_trade_risk_pct <= 100.0 and config.per_trade_risk_pct > config.max_daily_loss_pct:
         errors.append(f"PER_TRADE_RISK ({config.per_trade_risk_pct}%) should be <= MAX_DAILY_LOSS ({config.max_daily_loss_pct}%)")
     
     if errors:

@@ -1,178 +1,346 @@
-# Upbit Trading Bot - Mean Reversion Strategy
+# XRP/KRW 1분봉 스캘핑 봇
 
-업비트 거래소에서 동작하는 RSI + 볼린저밴드 기반 평균회귀 스캘핑 알고리즘입니다.
+## 개요
 
-## 주요 특징
+- **거래소**: Upbit
+- **심볼**: XRP/KRW
+- **타임프레임**: 1분봉
+- **거래 모드**: 초단타 스캘핑 (1~5분 내 진입·청산)
+- **전략**: EMA 레짐 감지 + 다중 진입/청산 신호
+- **리스크 관리**: 고정 스탑/테이크프로핏 또는 ATR 기반 스탑
+- **주문**: 시장가 주문 (지정가 폴백 지원)
 
-### 전략
+---
 
-- **시장 상태 감지**: ADX/ATR 기반 레짐 감지 (횡보/상승추세/하락추세)
-- **평균회귀 진입**: RSI 과매도/과매수 + 볼린저밴드 이탈 조합
-- **스마트 청산**: 중간 밴드 회귀 or ATR 기반 손절/익절
-- **레짐별 분기**: 횡보장에서만 활성화, 추세장 시 일시정지
-
-### 리스크 관리
-
-- **포지션 사이징**: ATR 기반 동적 크기 조절
-- **손절/익절**: ATR의 2배/3배 자동 설정
-- **계좌 보호**: 일일 손실 한도 5%, 최대 드로우다운 15%
-- **연속 손실 제한**: 5회 연속 손실 시 자동 중단
-- **변동성 조절**: 급등 감지 시 포지션 축소
-
-### 실행 효율
-
-- **지정가 우선**: 슬리피지 최소화, 타임아웃 시 시장가 전환
-- **부분 체결 처리**: 미체결 주문 추적 및 재주문
-- **슬리피지 모니터링**: 실시간 체결 품질 추적
-
-### 모니터링
-
-- **구조적 로깅**: CSV 형식 (ts, lvl, src, sym, evt, msg, kv)
-- **텔레그램 알림**: 포지션 개시/청산, 리스크 경고, 일일 요약
-- **실시간 상태**: 계좌 잔고, 미실현손익, 연속손실 추적
-
-## 시스템 구조
-
-```
-src/
-├── core/         # 공용 타입, 유틸, 시간/가격 변환
-├── exchange/     # CCXT 래퍼 (업비트 전용 구현)
-├── indicators/   # RSI, BB, ADX, ATR, MAs
-├── strategy/     # regime_detector, mean_reversion
-├── risk/         # risk_manager (sizing, stops, DD control)
-├── exec/         # order_router, position_tracker
-├── monitor/      # logger (CSV), alerts (Telegram)
-└── app/          # main (런처), config (.env 로딩)
-```
-
-## 설치 및 실행
+## 설치 & 실행
 
 ### 1. 의존성 설치
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ### 2. 환경 설정
 
 ```bash
+# .env 파일이 이미 있으면 그대로 사용
+# 없으면 .env.example을 복사하여 수정
 cp .env.example .env
-# .env 파일을 열어 UPBIT_API_KEY와 UPBIT_API_SECRET 입력
+
+# .env에서 다음 항목 확인:
+# - UPBIT_API_KEY
+# - UPBIT_API_SECRET
+# - DRY_RUN (테스트: true, 실거래: false)
+# - INITIAL_BALANCE (드라이런 초기자금)
+# - TRADING_SYMBOLS (XRP/KRW 권장)
 ```
 
 ### 3. 실행
 
+**드라이런 (시뮬레이션)**
+
 ```bash
-python -m src.app.main
+DRY_RUN=true python3 -m src.app.scalping_bot
 ```
 
-## 환경 변수 설정
+**실거래**
 
-`.env` 파일에서 다음 파라미터를 조정할 수 있습니다:
+```bash
+# 주의: 실제 자금이 사용됩니다
+DRY_RUN=false python3 -m src.app.scalping_bot
+```
 
-### 필수 설정
+**백그라운드 실행 (MacBook)**
 
-- `UPBIT_API_KEY`: 업비트 API 키
-- `UPBIT_API_SECRET`: 업비트 API 시크릿
+```bash
+# 절전 모드 방지 + 백그라운드 실행
+caffeinate -d python3 -m src.app.scalping_bot &
+```
+
+---
+
+## 주요 설정 (.env)
+
+### 거래 파라미터
+
+| 항목                     | 기본값    | 설명          |
+| ------------------------ | --------- | ------------- |
+| `TRADING_SYMBOLS`        | `XRP/KRW` | 거래 심볼     |
+| `TIMEFRAME`              | `1m`      | 캔들 주기     |
+| `CHECK_INTERVAL_SECONDS` | `10`      | 체크 주기(초) |
 
 ### 전략 파라미터
 
-- `TRADING_SYMBOLS`: 거래 심볼 (쉼표 구분, 예: BTC/KRW,ETH/KRW)
-- `TIMEFRAME`: 캔들 타임프레임 (1m, 5m, 15m, 1h 등)
-- `RSI_PERIOD`: RSI 계산 기간 (기본: 14)
-- `RSI_OVERSOLD`: RSI 과매도 기준 (기본: 30)
-- `RSI_OVERBOUGHT`: RSI 과매수 기준 (기본: 70)
-- `BB_PERIOD`: 볼린저밴드 기간 (기본: 20)
-- `BB_STD_DEV`: 볼린저밴드 표준편차 배수 (기본: 2.0)
-- `ADX_THRESHOLD_LOW`: 횡보장 판단 ADX 하한 (기본: 20)
-- `ADX_THRESHOLD_HIGH`: 추세장 판단 ADX 상한 (기본: 25)
+| 항목                     | 기본값 | 설명                  |
+| ------------------------ | ------ | --------------------- |
+| `RSI_PERIOD`             | `14`   | RSI 기간              |
+| `RSI_OVERSOLD`           | `35`   | RSI 과매도선          |
+| `RSI_OVERBOUGHT`         | `65`   | RSI 과매수선          |
+| `BB_PERIOD`              | `20`   | 볼린저밴드 기간       |
+| `BB_STD_DEV`             | `2.0`  | 볼린저밴드 표준편차   |
+| `BB_WIDTH_MIN`           | `0.2`  | BB 폭 최소(%)         |
+| `BB_WIDTH_MAX`           | `15.0` | BB 폭 최대(%)         |
+| `ENTRY_COOLDOWN_SECONDS` | `15`   | 진입 쿨다운(초)       |
+| `TIME_STOP_MINUTES`      | `5`    | 포지션 보유 시간 제한 |
 
-### 리스크 파라미터
+### 리스크 관리
 
-- `PER_TRADE_RISK`: 거래당 리스크 % (기본: 2.0)
-- `MAX_DAILY_LOSS`: 일일 최대 손실 % (기본: 5.0)
-- `MAX_CONSECUTIVE_LOSSES`: 최대 연속 손실 횟수 (기본: 5)
-- `MAX_DRAWDOWN`: 최대 드로우다운 % (기본: 15.0)
-- `STOP_ATR_MULTIPLIER`: 손절 ATR 배수 (기본: 2.0)
-- `TARGET_ATR_MULTIPLIER`: 익절 ATR 배수 (기본: 3.0)
+| 항목                     | 기본값  | 설명                 |
+| ------------------------ | ------- | -------------------- |
+| `PER_TRADE_RISK`         | `8.0`   | 1회 거래 리스크(%)   |
+| `MAX_DAILY_LOSS`         | `20.0`  | 하루 최대 손실(%)    |
+| `MAX_CONSECUTIVE_LOSSES` | `10`    | 연속 손실 제한(횟수) |
+| `MAX_DRAWDOWN`           | `100.0` | 최대 낙폭(%)         |
+| `MAX_POSITION_SIZE`      | `50.0`  | 최대 포지션 크기(%)  |
 
-### 텔레그램 알림 (선택사항)
+### 스탑/테이크프로핏
 
-- `TELEGRAM_BOT_TOKEN`: 텔레그램 봇 토큰
-- `TELEGRAM_CHAT_ID`: 텔레그램 채팅 ID
+| 항목                        | 기본값 | 설명           |
+| --------------------------- | ------ | -------------- |
+| `USE_FIXED_STOPS`           | `true` | 고정 스탑 사용 |
+| `FIXED_STOP_LOSS_PCT`       | `0.18` | 고정 손절(%\*) |
+| `FIXED_TAKE_PROFIT_PCT`     | `0.30` | 고정 익절(%)   |
+| `DOWNTREND_STOP_LOSS_PCT`   | `0.15` | 하락장 손절(%) |
+| `DOWNTREND_TAKE_PROFIT_PCT` | `0.20` | 하락장 익절(%) |
 
-## 안전 수칙
+### 주문/실행
 
-### ⚠️ 실전 운용 전 필수 체크리스트
+| 항목                          | 기본값   | 설명                    |
+| ----------------------------- | -------- | ----------------------- |
+| `DEFAULT_ORDER_TYPE`          | `market` | 주문 유형(market/limit) |
+| `LIMIT_ORDER_TIMEOUT_SECONDS` | `30`     | 지정가 타임아웃(초)     |
+| `MAX_SLIPPAGE_PCT`            | `0.5`    | 최대 슬리피지(%)        |
 
-1. **백테스트 수행**: 다양한 시장 상황에서 전략 검증
-2. **소액 테스트**: 최소 금액으로 실전 테스트
-3. **API 권한 제한**: 출금 권한 비활성화
-4. **모니터링 체계**: 텔레그램 알림 설정
-5. **리스크 한도 확인**: 일일 손실 한도 및 드로우다운 설정
-6. **네트워크 안정성**: 안정적인 인터넷 연결 확보
+---
 
-### 🚨 주의사항
+## 거래 전략
 
-- **절대 실제 자금 전액 투입 금지**: 손실 감내 가능한 금액만 사용
-- **API 키 보안**: .env 파일을 절대 공개 저장소에 커밋하지 말 것
-- **시장 급변 대응**: 중요 경제 지표 발표 시 알고리즘 일시정지 고려
-- **주기적 점검**: 전략 성과를 정기적으로 리뷰하고 파라미터 조정
-- **슬리피지 모니터링**: 슬리피지가 과도하면 거래 규모 축소
+### 레짐 감지 (EMA 기반)
 
-## 로그 분석
+- **상승장**: EMA 9 > EMA 21 (정배열)
+- **하락장**: EMA 9 < EMA 21 (역배열)
+- **횡보장**: EMA 괴리도 < 0.3%
 
-로그는 `logs/` 디렉토리에 CSV 형식으로 저장됩니다.
+### 진입 조건
 
-### 로그 형식
+#### 상승장 롱
 
-```csv
-ts,lvl,src,sym,evt,msg,kv
-2024-01-01T12:00:00Z,INFO,strategy,BTC/KRW,signal,"Long signal: RSI=25",{"rsi":25,"bb_pos":-120}
+- EMA 정배열 상태
+- BB 폭 필터 충족 (0.2% ~ 15%)
+- 가격이 EMA 9 ±0.5% 범위 내
+- RSI 35~55 (과매도/과매수 아님)
+- 쿨다운 충족 (15초)
+
+#### 하락장 바운스 롱
+
+- EMA 역배열 상태
+- RSI ≤ 35 (과매도)
+- BB 위치 < -40 (하단 근처)
+- 저가 바운스 신호 감지
+
+#### 횡보장 롱 (평균회귀)
+
+- EMA 괴리도 < 0.3%
+- BB 위치 < -20 (하단 반부)
+- RSI < 50
+
+### 청산 조건
+
+| 조건          | 설명                    |
+| ------------- | ----------------------- |
+| **고정 손절** | 입가 - 0.18%            |
+| **고정 익절** | 입가 + 0.30%            |
+| **시간 종료** | 5분 보유 후 시장가 청산 |
+| **RSI 청산**  | RSI ≥ 70 (과매수)       |
+| **BB 청산**   | BB 상단 + RSI > 60      |
+| **횡보 회귀** | BB 중단선 회귀 신호     |
+
+---
+
+## 위험 관리
+
+### 포지션 사이징
+
+```
+위험금액 = 계좌잔고 × (PER_TRADE_RISK / 100)
+손절거리 = |진입가 - 손절가|
+포지션수량 = 위험금액 / 손절거리
+최대노션 = 계좌잔고 × (MAX_POSITION_SIZE / 100)
+최종수량 = MIN(위험금액 기반 수량, 최대노션)
 ```
 
-### Python으로 로그 분석
+### 리스크 한도
 
-```python
-import pandas as pd
+- 1거래 최대 손실: PER_TRADE_RISK (%)
+- 일간 최대 손실: MAX_DAILY_LOSS (%)
+- 연속 손실 제한: MAX_CONSECUTIVE_LOSSES (회)
+- 최대 낙폭: MAX_DRAWDOWN (%)
 
-# 로그 읽기
-df = pd.read_csv('logs/trading_20240101.csv')
+한도 초과 시 **자동 진입 중단** (기존 포지션은 청산)
 
-# 신호 필터링
-signals = df[df['evt'] == 'signal']
+### 주문 검증
 
-# 거래 통계
-trades = df[df['evt'] == 'trade_closed']
-print(f"Total trades: {len(trades)}")
-print(f"Win rate: {(trades['msg'].str.contains('PnL: [0-9]+\\.').sum() / len(trades)) * 100:.1f}%")
+- 시장가 주문으로 진입/청산
+- 지정가 전환 옵션 지원 (미체결 시)
+- 슬리피지 제한: MAX_SLIPPAGE_PCT (%)
+- 슬리피지 초과 시 경고 로그
+
+---
+
+## 로그 & 모니터링
+
+### 로그 위치
+
+- **콘솔**: 실시간 거래 로그 (진입/청산/손익)
+- **파일**: `logs/trading_YYYYMMDD.csv` (거래 기록)
+
+### 주요 로그 항목
+
+```
+[요약] 잔고: 129,745 KRW | 일손익: +1,234 KRW (+0.95%) | 가격: XRP/KRW:3,152 | 레짐: XRP/KRW:상승장
+
+[XRP/KRW] ✅ 포지션 오픈: BUY 20.50941077 @ 3152.00
+[XRP/KRW] ✅ 포지션 청산 | 손익: +23.45 KRW | 일간 손익: +23.45 KRW | 이유: Take profit hit
 ```
 
-## 개발 및 커스터마이징
+### Telegram 알림 (선택)
 
-### 새로운 지표 추가
+- 진입/청산 신호
+- 리스크 한도 초과
+- 주문 오류 및 경고
 
-`src/indicators/indicators.py`에 순수 함수로 구현:
+설정: `.env`에서 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 
-```python
-def calculate_my_indicator(prices: List[float], period: int) -> np.ndarray:
-    # 구현
-    return result
+---
+
+## 실거래 안전 수칙
+
+### 필수 사전 점검
+
+1. **API 키 보안**
+
+   - 새 API 키 생성 (기존 키 교체)
+   - 허용 IP에 서버 공인 IPv4 등록
+   - 출금 권한 제거 (입금/거래만 허가)
+
+2. **소액 테스트**
+
+   - DRY_RUN으로 3~5일 백테스트
+   - 실거래 전 최소 금액으로 1~2시간 테스트
+
+3. **매개변수 검토**
+   - PER_TRADE_RISK = 1~2% 권장
+   - MAX_DAILY_LOSS = 5~10% 권장
+   - MAX_DRAWDOWN = 15~20% 권장
+
+### 실시간 모니터링
+
+- 첫 30분: 콘솔에서 실시간 감시
+- 1시간마다: 로그 파일 및 손익 확인
+- 일 2회(아침/저녁): 종합 점검
+
+### 중단 시점
+
+- **리스크 한도 초과** → 자동 중단 (재시작 필요)
+- **연속 5회 손실** → 수동 점검
+- **네트워크 이슈** → 즉시 중단
+
+### 거래 금지 시간대
+
+- 변동성 극저 시간 (야간 02:00~08:00)
+- 공급망 공지 예정 1시간 전후
+- 긴급 뉴스/이벤트 시
+
+---
+
+## 기술 스택
+
+| 항목        | 라이브러리       |
+| ----------- | ---------------- |
+| 거래소 API  | CCXT (Upbit)     |
+| 데이터 분석 | Pandas, NumPy    |
+| 비동기      | Asyncio, Aiohttp |
+| 로깅        | Python logging   |
+| 환경 설정   | python-dotenv    |
+
+---
+
+## 프로젝트 구조
+
+```
+copy-copy/
+├── src/
+│   ├── app/              # 봇 메인
+│   │   ├── scalping_bot.py
+│   │   └── config.py
+│   ├── exchange/         # 거래소 연동
+│   │   ├── upbit.py
+│   │   └── paper.py
+│   ├── strategy/         # 거래 전략
+│   │   ├── scalping_strategy.py
+│   │   └── fast_regime_detector.py
+│   ├── risk/             # 리스크 관리
+│   │   └── risk_manager.py
+│   ├── exec/             # 주문 실행
+│   │   ├── order_router.py
+│   │   └── position_tracker.py
+│   ├── monitor/          # 모니터링
+│   │   ├── logger.py
+│   │   └── alerts.py
+│   └── core/             # 핵심 유틸
+│       ├── types.py
+│       └── utils.py
+├── logs/                 # 거래 로그
+├── tests/                # 단위 테스트
+├── .env                  # 환경 설정 (예: API 키)
+├── .env.example          # 템플릿
+├── requirements.txt      # 의존성
+└── README.md            # 이 파일
 ```
 
-### 전략 수정
+---
 
-`src/strategy/mean_reversion.py`의 `generate_entry_signal()` 메서드 수정
+## 주의사항
 
-### 리스크 규칙 조정
+⚠️ **이 프로젝트는 교육/연구 목적이며, 실거래 손실에 대한 책임은 전적으로 사용자에게 있습니다.**
 
-`src/risk/risk_manager.py`에서 한도 체크 로직 수정
+- API 키와 잔고 보안에 유의하세요.
+- 실거래 전 백테스트 및 소액 테스트를 필수로 수행하세요.
+- 불안정한 네트워크에서는 실거래를 피하세요.
+- 시스템 오류나 예상치 못한 손실에 대비하세요.
 
-## 라이선스
+---
 
-이 프로젝트는 교육 및 연구 목적으로 제공됩니다.
-실제 거래에서 발생하는 손실에 대해 개발자는 책임지지 않습니다.
+## 문제 해결
 
-## 문의 및 기여
+### 자주 발생하는 오류
 
-이슈 및 개선 제안은 GitHub Issues를 통해 제출해주세요.
+**"insufficient_funds_ask"**
+
+- 원인: 주문 수량이 보유량을 초과
+- 해결: PER_TRADE_RISK 감소 또는 MAX_POSITION_SIZE 감소
+
+**"Order timeout (타임아웃)"**
+
+- 원인: 네트워크 지연 또는 거래소 과부하
+- 해결: LIMIT_ORDER_TIMEOUT_SECONDS 증가
+
+**"캔들 조회 오류"**
+
+- 원인: Upbit API 일시 불안정
+- 해결: 몇 분 대기 후 봇 재시작
+
+### 로그 레벨 변경
+
+```bash
+LOG_LEVEL=DEBUG python3 -m src.app.scalping_bot  # 상세 로그
+LOG_LEVEL=INFO python3 -m src.app.scalping_bot   # 일반 로그
+```
+
+---
+
+## 지원 & 피드백
+
+질문이나 버그 리포트는 프로젝트 이슈 트래커에 남겨주세요.
+
+**마지막 업데이트**: 2025년 11월 21일

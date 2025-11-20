@@ -89,7 +89,7 @@ class PositionTracker:
         self.open_positions[symbol] = position
 
         logger.info(
-            "Position opened: %s %.6f %s @ %.6f (SL=%s, TP=%s)",
+            "포지션 오픈: %s %.6f %s @ %.6f (SL=%s, TP=%s)",
             side.value,
             position.size,
             symbol,
@@ -106,15 +106,20 @@ class PositionTracker:
         exit_price: float,
         fees: Optional[float] = None,
         slippage_pct: Optional[float] = None,
+        filled_amount: Optional[float] = None,
     ) -> Optional[Trade]:
         """
         Close existing position and create Trade record.
+        Supports partial liquidation.
 
         Args:
             symbol: Trading symbol
             exit_price: Actual executed exit price (already includes slippage)
-            fees: Net fees for the round trip (if None, computed as taker on both sides)
+            fees: Net fees for the round trip (exit_fees only, not entry)
+                  If None, computed as taker on exit side only
             slippage_pct: Optional slippage percentage vs reference (for logging/stat only)
+            filled_amount: Actual filled amount for partial liquidation
+                          If None or >= position.size, closes entire position
 
         Returns:
             Trade or None if no open position.
@@ -131,20 +136,26 @@ class PositionTracker:
         exit_price = float(exit_price)
         exit_time = now_utc()
 
-        # Gross PnL (before fees)
+        # Determine close amount (partial or full)
+        close_size = position.size
+        is_partial = False
+        if filled_amount is not None and filled_amount > 0:
+            close_size = min(float(filled_amount), position.size)
+            is_partial = close_size < position.size
+
+        # Gross PnL (before fees) - calculated on closed size only
         if position.side == OrderSide.BUY:
-            gross_pnl = (exit_price - position.entry_price) * position.size
+            gross_pnl = (exit_price - position.entry_price) * close_size
             pnl_pct = ((exit_price / position.entry_price) - 1.0) * 100.0
         else:
-            gross_pnl = (position.entry_price - exit_price) * position.size
+            gross_pnl = (position.entry_price - exit_price) * close_size
             pnl_pct = (1.0 - (exit_price / position.entry_price)) * 100.0
 
-        # Fees
+        # Fees: exit side only (entry fees already deducted from balance)
         if fees is None:
-            # Conservative default: charge both entry & exit
-            entry_fees = calculate_fees(position.size, position.entry_price)
-            exit_fees = calculate_fees(position.size, exit_price)
-            fees = float(entry_fees + exit_fees)
+            # Exit fees only: taker fee on exit side (based on closed size)
+            exit_fees = calculate_fees(close_size, exit_price)
+            fees = float(exit_fees)
         else:
             fees = float(fees)
 
@@ -155,7 +166,7 @@ class PositionTracker:
             timestamp=exit_time,
             symbol=symbol,
             side=position.side,
-            size=position.size,
+            size=close_size,
             entry_price=position.entry_price,
             exit_price=exit_price,
             pnl=net_pnl,
@@ -166,21 +177,47 @@ class PositionTracker:
         )
 
         # State update
-        del self.open_positions[symbol]
+        if is_partial:
+            # Partial close: reduce position size, keep in open_positions
+            original_size = position.size
+            logger.debug(f"[POSITION SIZE CHANGE] {symbol}: {original_size:.8f} → reducing by {close_size:.8f}")
+            position.size -= close_size
+            logger.debug(f"[POSITION SIZE CHANGE] {symbol}: after reduction = {position.size:.8f}")
+            logger.info(
+                "Position partially closed: %s %s @ %.6f (Closed: %.6f / %.6f, Remaining: %.6f, NetPnL=%.6f, %.4f%%, fees=%.6f)",
+                position.side.value,
+                symbol,
+                exit_price,
+                close_size,
+                original_size,
+                position.size,
+                net_pnl,
+                pnl_pct,
+                fees,
+            )
+            
+            # 극미량 포지션 정리 (부동소수점 오차 제거)
+            if position.size < 1e-6:
+                logger.info(f"[{symbol}] 극미량 포지션 삭제됨 ({position.size:.10f})")
+                del self.open_positions[symbol]
+        else:
+            # Full close: delete position
+            logger.debug(f"[POSITION SIZE CHANGE] {symbol}: {position.size:.8f} → deleting entire position")
+            del self.open_positions[symbol]
+            logger.debug(f"[POSITION SIZE CHANGE] {symbol}: position deleted from open_positions")
+            logger.info(
+                "Position closed: %s %s @ %.6f (NetPnL=%.6f, %.4f%%, dur=%.0fs, fees=%.6f, slip=%.4f%%)",
+                position.side.value,
+                symbol,
+                exit_price,
+                net_pnl,
+                pnl_pct,
+                duration_seconds,
+                fees,
+                slippage_pct or 0.0,
+            )
+
         self.closed_trades.append(trade)
-
-        logger.info(
-            "Position closed: %s %s @ %.6f (NetPnL=%.6f, %.4f%%, dur=%.0fs, fees=%.6f, slip=%.4f%%)",
-            position.side.value,
-            symbol,
-            exit_price,
-            net_pnl,
-            pnl_pct,
-            duration_seconds,
-            fees,
-            slippage_pct or 0.0,
-        )
-
         return trade
 
     # =========================

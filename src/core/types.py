@@ -134,7 +134,9 @@ class AccountState:
 
     @property
     def current_drawdown_pct(self) -> float:
-        """Calculate current drawdown percentage."""
+        """Calculate current drawdown percentage (realized balance only)."""
         if self.max_equity == 0:
             return 0.0
-        return ((self.max_equity - self.equity) / self.max_equity) * 100
+        # Use total_balance (realized) instead of equity (includes unrealized PnL)
+        # This prevents false drawdown alerts from open position fluctuations
+        return ((self.max_equity - self.total_balance) / self.max_equity) * 100

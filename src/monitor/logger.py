@@ -4,15 +4,17 @@ Logs events in consistent format for analysis.
 """
 import csv
 import json
+import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
-import logging
 
 from src.core.time_utils import now_utc
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class StructuredLogger:
@@ -23,11 +25,11 @@ class StructuredLogger:
 
     def __init__(self, log_dir: str = "logs", use_async: bool = True):
         """
-        Initialize structured logger with async buffering.
+        Initialize structured logger with buffering.
 
         Args:
             log_dir: Directory for log files
-            use_async: Enable async logging with QueueHandler (default: True)
+            use_async: Enable buffering (default: True)
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -40,25 +42,16 @@ class StructuredLogger:
         if not self.log_file.exists():
             self._write_header()
 
-        # Setup async logging with buffering
+        # Setup buffering
         self.use_async = use_async
+        self._buffer = []
+        self._lock = None
+        
         if use_async:
-            import asyncio
-            import queue
             import threading
-            from logging.handlers import QueueHandler, QueueListener
-            
-            self._log_queue = queue.Queue(maxsize=1000)
-            self._stop_event = threading.Event()
-            self._listener_thread = threading.Thread(
-                target=self._async_writer_loop,
-                daemon=True
-            )
-            self._listener_thread.start()
-        else:
-            self._log_queue = None
+            self._lock = threading.Lock()
 
-        logger.info(f"Structured logger initialized: {self.log_file} (async={use_async})")
+        logger.info(f"구조화 로거 준비: {self.log_file} (async={use_async})")
 
     def _write_header(self):
         """Write CSV header."""
@@ -66,64 +59,14 @@ class StructuredLogger:
             writer = csv.writer(f)
             writer.writerow(['ts', 'lvl', 'src', 'sym', 'evt', 'msg', 'kv'])
 
-    def _async_writer_loop(self):
-        """Background thread for async log writing."""
-        import queue
-        
-        buffer = []
-        FLUSH_INTERVAL = 1.0  # seconds
-        BATCH_SIZE = 50
-        
-        last_flush = datetime.now()
-        
-        while not self._stop_event.is_set():
-            try:
-                # Try to get log entries with timeout
-                try:
-                    entry = self._log_queue.get(timeout=0.1)
-                    buffer.append(entry)
-                except queue.Empty:
-                    pass
-                
-                # Flush conditions: batch size or time interval
-                now = datetime.now()
-                should_flush = (
-                    len(buffer) >= BATCH_SIZE or
-                    (buffer and (now - last_flush).total_seconds() >= FLUSH_INTERVAL)
-                )
-                
-                if should_flush:
-                    self._flush_buffer(buffer)
-                    buffer.clear()
-                    last_flush = now
-                    
-            except Exception as e:
-                logger.error(f"Async writer error: {e}")
-        
-        # Final flush on shutdown
-        if buffer:
-            self._flush_buffer(buffer)
-    
-    def _flush_buffer(self, buffer):
-        """Flush buffered log entries to file."""
-        if not buffer:
-            return
-        
-        try:
-            with open(self.log_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                for entry in buffer:
-                    writer.writerow(entry)
-        except Exception as e:
-            logger.error(f"Failed to flush log buffer: {e}")
-    
     def shutdown(self):
-        """Gracefully shutdown async logger."""
-        if self.use_async and hasattr(self, '_stop_event'):
-            self._stop_event.set()
-            if hasattr(self, '_listener_thread'):
-                self._listener_thread.join(timeout=5.0)
-            logger.info("Async logger shutdown complete")
+        """Gracefully shutdown logger and flush buffer."""
+        if self.use_async and self._lock:
+            with self._lock:
+                if self._buffer:
+                    self._flush_buffer(self._buffer)
+                    self._buffer.clear()
+        logger.info("Structured logger shutdown complete")
 
     def log(
         self,
@@ -135,7 +78,7 @@ class StructuredLogger:
         extra: Optional[Dict[str, Any]] = None
     ):
         """
-        Log structured event with async buffering.
+        Log structured event immediately to CSV.
 
         Args:
             level: Log level (INFO, WARNING, ERROR, CRITICAL)
@@ -150,16 +93,21 @@ class StructuredLogger:
         
         entry = [timestamp, level, source, symbol, event, message, kv_json]
         
-        if self.use_async:
-            # Send to async queue
-            try:
-                self._log_queue.put_nowait(entry)
-            except Exception:
-                # Queue full, fallback to sync write
-                self._write_sync(entry)
-        else:
-            # Synchronous write
-            self._write_sync(entry)
+        # Always write immediately for real-time logging
+        self._write_sync(entry)
+    
+    def _flush_buffer(self, buffer):
+        """Flush buffered log entries to file."""
+        if not buffer:
+            return
+        
+        try:
+            with open(self.log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                for entry in buffer:
+                    writer.writerow(entry)
+        except Exception as e:
+            logger.error(f"Failed to flush log buffer: {e}")
     
     def _write_sync(self, entry):
         """Write single entry synchronously (fallback)."""
@@ -344,3 +292,19 @@ class StructuredLogger:
                 'indicators': indicators
             }
         )
+
+
+def setup_logging(log_dir: str = "logs") -> "StructuredLogger":
+    """
+    Configure root logging and return a structured logger instance.
+
+    - Sets a console handler for human-readable logs.
+    - Returns StructuredLogger for CSV/event logging.
+    """
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    return StructuredLogger(log_dir=log_dir, use_async=True)

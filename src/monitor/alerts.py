@@ -127,3 +127,7 @@ class TelegramAlerter:
             f"Avg PnL: {stats.get('avg_pnl', 0):.2f}"
         )
         await self.send_message(message)
+
+
+# Backwards compatibility alias
+TelegramAlerts = TelegramAlerter

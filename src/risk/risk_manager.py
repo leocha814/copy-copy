@@ -307,57 +307,23 @@ class RiskManager:
     # Stop / Target checks
     # =========================
 
-    def check_stop_loss(self, position: Position) -> bool:
-        """
-        Return True if stop loss is hit.
-        """
-        sl = position.stop_loss
-        price = position.current_price
-
-        if _is_bad_number(sl) or _is_bad_number(price):
+    def check_stop_loss(self, current_price: float, stop_loss_price: float, side: OrderSide) -> bool:
+        """Return True if stop loss is hit."""
+        if _is_bad_number(stop_loss_price) or _is_bad_number(current_price):
             return False
 
-        if position.side == OrderSide.BUY:
-            hit = price <= sl
-        else:
-            hit = price >= sl
+        if side == OrderSide.BUY:
+            return current_price <= stop_loss_price
+        return current_price >= stop_loss_price
 
-        if hit:
-            logger.warning(
-                "Stop loss hit: %s %s @ %.4f (SL: %.4f)",
-                position.symbol,
-                position.side.value,
-                price,
-                sl,
-            )
-
-        return hit
-
-    def check_take_profit(self, position: Position) -> bool:
-        """
-        Return True if take profit is hit.
-        """
-        tp = position.take_profit
-        price = position.current_price
-
-        if _is_bad_number(tp) or _is_bad_number(price):
+    def check_take_profit(self, current_price: float, take_profit_price: float, side: OrderSide) -> bool:
+        """Return True if take profit is hit."""
+        if _is_bad_number(take_profit_price) or _is_bad_number(current_price):
             return False
 
-        if position.side == OrderSide.BUY:
-            hit = price >= tp
-        else:
-            hit = price <= tp
-
-        if hit:
-            logger.info(
-                "Take profit hit: %s %s @ %.4f (TP: %.4f)",
-                position.symbol,
-                position.side.value,
-                price,
-                tp,
-            )
-
-        return hit
+        if side == OrderSide.BUY:
+            return current_price >= take_profit_price
+        return current_price <= take_profit_price
 
     # =========================
     # Account-level limits
@@ -365,7 +331,7 @@ class RiskManager:
 
     def check_daily_loss_limit(self, account: AccountState) -> bool:
         """
-        Check if daily loss limit exceeded.
+        Check if daily loss limit exceeded (applies to losses only).
 
         Returns:
             True if limit breached (trading halted inside).
@@ -374,6 +340,10 @@ class RiskManager:
             logger.error(
                 "Total balance non-positive or invalid; cannot compute daily loss pct."
             )
+            return False
+
+        # 손실일 때만 한도 확인 (수익 시는 무조건 통과)
+        if account.daily_pnl >= 0:
             return False
 
         daily_loss_pct = abs(account.daily_pnl / account.total_balance) * 100.0
