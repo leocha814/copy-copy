@@ -4,8 +4,9 @@
 업비트 KRW 마켓 1분봉 초단기 스캘핑 봇. 메인 루프는 **“잔액조회 → 진입검증 → 100% 매수 → 청산검증 → 100% 매도 → 반복”** 단일 흐름을 강제하며, 부분 청산 없이 전량 매수·전량 매도로 포지션을 관리합니다. 레짐(상승/하락/횡보) 감지 후 레짐별 진입/청산 로직을 적용하고, 수익성·리스크 필터를 선행합니다.
 
 ## 2. 주요 기능 (Features)
-- EMA 기반 **Fast Regime Detector**로 상승/하락/횡보 및 EMA 기울기 감지
+- EMA 기반 **Fast Regime Detector** + ADX(14)로 상승/하락/횡보 및 추세 강도 컨텍스트 제공
 - RSI, Bollinger Band, 거래량 필터를 적용한 진입 로직
+- MACD(12/26/9), Stochastic(14/3/3)을 포함한 Entry Score 시스템(0~100)으로 신호 강도 판단
 - 고정 % 또는 ATR 기반 SL/TP 계산, 사전 수익성(RR) 체크
 - 심볼별 쿨다운, 시간당 진입 횟수 제한
 - 메이커 우선 지정가 재시도 후 시장가 폴백
@@ -28,6 +29,7 @@
                      ↓
                   (반복)
 ```
+※ Regime Detection 후 ADX 필터(약추세 차단), Entry Score 계산(지표 가중) → 진입 여부 결정
 
 ## 4. 설치 및 실행 방법 (Installation & Usage)
 
@@ -46,7 +48,7 @@ TIMEFRAME=1m
 DRY_RUN=true           # 실거래 시 false
 DEFAULT_ORDER_TYPE=market
 PREFER_MAKER=false     # 메이커 우선 사용 시 true
-# 추세 추격 모드: 항상 ON (설정 없음)
+# 추세/모멘텀은 스코어 기반으로 자동 적용
 TREND_RSI_MIN=60
 TREND_BB_POS_MIN=60
 TREND_PRICE_ABOVE_EMA_PCT=0.3
@@ -70,26 +72,45 @@ python -m src.app.scalping_bot
 ## 5. 전략 설명 (Strategy Logic)
 
 ### 5-1. 진입 조건
-- 레짐: FastRegimeDetector(EMA9/21)로 상승/하락/횡보 판정, EMA 기울기 과도 시 횡보 역추세 차단
-- 지표 필터:
-  - RSI: `rsi_entry_low ≤ RSI ≤ rsi_entry_high`
-  - Bollinger Band: `bb_pos_entry_max` 이하(깊은 하단 근접)
-  - 밴드 폭: `bb_width_min ≤ BB width ≤ bb_width_max`
-  - 거래량: 최근 봉 거래량 ≥ 과거 `volume_lookback` 평균 × `volume_confirm_multiplier`
-- 수익성: 예상 TP/SL 대비 수수료(fee_rate_pct) + 슬리피지 버퍼(slippage_buffer_pct) 반영 후 `min_expected_rr` 이상일 때만 진입
-- 쿨다운/횟수 제한: 심볼별 `entry_cooldown_seconds`, `max_entries_per_hour` 적용
-- **추세 추격 모드**: 상승장에서 모멘텀 돌파 진입(항상 활성화)
-  - 조건: RSI ≥ `trend_rsi_min`, BB 포지션 ≥ `trend_bb_pos_min`, 가격이 EMA_fast 대비 `trend_price_above_ema_pct` 이상 상회, 거래량 `trend_volume_multiplier` 배 이상
 
-### 5-2. 청산 조건 (100% 매도)
-- 고정 SL/TP 또는 ATR 기반 SL/TP 도달 시 전량 청산
-- 과매수/BB 상단, 횡보 중단선 터치 등 조건 충족 시 전량 청산
-- 시간 스탑(설정 시) 도달 시 전량 청산
+#### 5-1-A. Entry Score System (0-100)
+- Base: 40점 (보수적 시작)
+- MACD (12/26/9): 라인 > 시그널 & |Hist|>0.001 → +20, 약하면 +10 / 라인 < 시그널-0.01 → -15
+- Stochastic (14/3/3): K<20 → +15, 20-30 → +10, 30-70 → -5, >80 → -10, K>D 상향 크로스 → +8
+- ADX(14): None/<20 → -15, 20-25 → 0, 25-35 → +5, ≥35 → +10
+- EMA 크로스 신선도: 직후 +25, 1~3봉 +15, 4~7봉 +5
+- 거래량 스파이크(최근 ≥ 평균×2): +15
+- **진입 기준: 60점 이상일 때만 진입**
+
+#### 5-1-B. 레짐·필터
+- 레짐: FastRegimeDetector(EMA9/21) + ADX 14주기 컨텍스트
+  - ADX < 20: 진입 차단
+  - ADX 20~25: 중립, 25~35: 강, 35+: 매우 강
+- 필터: BB 폭 `bb_width_min~max`, 거래량 `volume_confirm_multiplier`, 쿨다운/횟수 제한
+
+#### 5-1-C. 패턴별 진입
+- 상승장(풀백): 가격/EMA_fast ±0.5%, RSI 35~55, 기본 스코어 충족 시 진입
+- 하락장 바운스(반등):
+  - Essential 3: EMA_trend 하락, RSI ≤ 25, BB_position < -40
+  - Momentum 4 중 2개 이상: 가격 반등 시작, 거래량 스파이크(≥2x), RSI 턴(+2 이상), MACD 히스토그램 상승
+- 횡보: BB 포지션 하단(예: <20) + RSI<55, 필터/스코어 충족 시 평균회귀 진입
+
+### 5-2. Downtrend Bounce (Counter-trend)
+- 진입 조건:
+  - Essential 3: EMA_trend 하락, RSI ≤ 25, BB_position < -40
+  - Momentum 4 중 2개 이상: 가격 반등 시작, 거래량 스파이크(≥2x), RSI 턴(+2 이상), MACD 히스토그램 상승
+- 청산: SL -0.15%, TP +0.20%
+
+### 5-3. 청산 조건 (100% 매도)
+- 일반: SL -0.20%, TP +0.35% (고정) 또는 ATR 기반 사용 시 설정값 적용
+- 하락장 바운스: SL -0.15%, TP +0.20%
+- 기술적 청산: BB 상단+RSI 과매수(>60~70), 횡보 중단선 회귀, 레짐 반전/거래량 급감 시 방어 청산
+- 시간 스탑: 사용하지 않음 (옵션 제거)
 - **부분 청산 없음**: 항상 전량 매도
 
 ### 5-3. 리스크 관리 방식
-- 전량 진입/전량 청산 단일 플로우
-- 슬리피지 경고(`max_slippage_pct`) 로깅
+- 전량 진입/전량 청산 기본, 점수 기반 사이징/ATR 사이징 옵션 제공
+- 슬리피지 경고(`max_slippage_pct`) 및 사전 스프레드 체크
 - 리스크 매개변수: `fixed_stop_loss_pct`, `fixed_take_profit_pct`, `use_atr_sl_tp`, `atr_stop_multiplier`, `atr_target_multiplier`
 - 진입 전 잔액 확인, 포지션 존재 시 재진입 금지
 

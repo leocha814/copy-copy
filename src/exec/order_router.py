@@ -264,12 +264,11 @@ class OrderRouter:
 
         if abs(slippage) > self.max_slippage_pct:
             logger.warning(
-                "High slippage: %.4f%% > %.4f%% for %s -- entry aborted",
+                "High slippage: %.4f%% > %.4f%% for %s -- keep position but review settings",
                 slippage,
                 self.max_slippage_pct,
                 signal.symbol,
             )
-            return None
 
         # Note: stop_loss / take_profit 실제 주문(조건부/OTO)은
         # 별도 Risk/Execution 모듈에서 처리하는 것을 권장.
@@ -523,59 +522,47 @@ class OrderRouter:
             logger.error(f"Failed to fetch ticker for {symbol}: {e}")
             return None
         
-        # 잔액 파싱 (Upbit CCXT format)
+        # 잔액 파싱 (Upbit CCXT format) 및 주문 수량 계산
+        order_amount = None
+        order_cost = 0.0
         if side == OrderSide.BUY:
             krw_balance = self._extract_krw_free_balance(balance)
+            if krw_balance <= 0:
+                logger.error(f"[{symbol}] 매수 잔액 부족: KRW {krw_balance}")
+                return None
             if amount_override is None:
-                # KRW 잔액으로 100% 매수 (가용액 free 기준)
-                if krw_balance <= 0:
-                    logger.error(f"[{symbol}] 매수 잔액 부족: KRW {krw_balance}")
-                    return None
-                
-                # 매수 수량 = KRW 잔액 / 현재가 (100% 사용)
-                size = krw_balance / current_price
+                # 슬리피지/수수료를 고려해 100% 사용
+                slippage_fee_ratio = 1.0 + (0.15 / 100.0) + (0.10 / 100.0)
+                order_cost = krw_balance / slippage_fee_ratio
+                order_amount = order_cost / current_price
             else:
-                size = amount_override
+                order_amount = amount_override
+                order_cost = order_amount * current_price
 
         elif side == OrderSide.SELL:
             if amount_override is None:
-                # 기본 통화(XRP 등) 잔액으로 100% 매도
                 base_currency = symbol.split('/')[0]  # XRP/KRW -> XRP
-                base_balance = self._extract_base_balance(balance, base_currency)
+                base_balance = self._extract_base_balance_free(balance, base_currency)
                 if base_balance <= 0:
                     logger.error(f"[{symbol}] 매도 잔액 부족: {base_currency} {base_balance}")
                     return None
-                
-                size = base_balance
+                order_amount = base_balance
             else:
-                size = amount_override
+                order_amount = amount_override
+            order_cost = order_amount * current_price
         
-        # Upbit 시장가 매수: amount는 코인 수량이 아니라 사용할 KRW 금액!
-        if side == OrderSide.BUY:
-            # BUY: KRW 가용액을 직접 사용 (부동소수점 오류 방지)
-            if amount_override is None:
-                # 슬리피지/수수료 대비 5% 여유 (가용액 불일치 대비)
-                order_cost = krw_balance * 0.95
-                order_amount = round_to_precision(order_cost / current_price, self.amount_precision)
-            else:
-                order_amount = round_to_precision(amount_override, self.amount_precision)
-                order_cost = order_amount * current_price
+        # Upbit 시장가: BUY는 KRW 금액, SELL은 코인 수량
+        order_amount = round_to_precision(order_amount, self.amount_precision)
+        if order_amount <= 0:
+            logger.error(f"[{symbol}] 주문 수량 부족: {order_amount}")
+            return None
+        order_cost = round_to_precision(order_amount * current_price, 0)  # KRW는 정수
 
-            order_cost = round_to_precision(order_cost, 0)  # KRW는 정수
-            if order_cost <= 0:
-                logger.error(f"[{symbol}] 100% 잔액 계산 후 주문 금액 부족: {order_cost}")
-                return None
+        if side == OrderSide.BUY:
             logger.info(
-                f"시장가 주문 (100% 잔액): {side.value} {order_amount:.8f} {symbol} "
-                f"~ {order_cost:.0f} KRW (가용 KRW={krw_balance:.0f})"
+                f"시장가 주문 (100% 잔액): {side.value} {order_amount:.8f} {symbol} ~ {order_cost:.0f} KRW"
             )
         else:
-            # SELL: size는 코인 수량
-            size = round_to_precision(size, self.amount_precision)
-            if size <= 0:
-                logger.error(f"[{symbol}] 100% 잔액 계산 후 수량 부족: {size}")
-                return None
-            order_amount = size
             logger.info(f"시장가 주문 (100% 잔액): {side.value} {order_amount:.8f} {symbol}")
 
         try:
@@ -616,7 +603,7 @@ class OrderRouter:
                     continue
                 
                 filled = float(final_status.get("filled", 0.0))
-                state = final_status.get("status")
+                state = str(final_status.get("status", "")).lower()
                 
                 # 체결됨 또는 취소됨 (但 filled > 0이면 체결로 인정)
                 if state in ["closed", "canceled"]:
@@ -636,7 +623,7 @@ class OrderRouter:
             # 폴링 완료 후에도 미체결 상태 체크
             if final_status:
                 filled = float(final_status.get("filled", 0.0))
-                state = final_status.get("status")
+                state = str(final_status.get("status", "")).lower()
                 
                 if filled > 0:
                     # 부분 체결이라도 반환 (부분 체결 처리는 caller에서)
@@ -697,4 +684,17 @@ class OrderRouter:
             return 0.0
         except Exception as e:
             logger.error(f"Failed to extract {base_currency} balance: {e}")
+            return 0.0
+
+    def _extract_base_balance_free(self, balance: Dict, base_currency: str) -> float:
+        """Upbit 잔액에서 특정 기본 통화 free 잔액만 추출."""
+        try:
+            if isinstance(balance, dict):
+                if base_currency in balance and isinstance(balance[base_currency], dict):
+                    return float(balance[base_currency].get('free', 0.0) or 0.0)
+                if 'free' in balance and isinstance(balance['free'], dict):
+                    return float(balance['free'].get(base_currency, 0.0) or 0.0)
+            return 0.0
+        except Exception as e:
+            logger.error(f"Failed to extract {base_currency} free balance: {e}")
             return 0.0

@@ -299,34 +299,38 @@ class ScalpingStrategy:
         ema_cross_bars: Optional[int] = None,
         volume_spike: bool = False,
     ) -> float:
-        score = 50.0
-        # MACD
+        score = 40.0  # 보수적 시작점
+        # MACD: signal/라인 비교 + 히스토그램 강도
         if macd_line is not None and macd_signal is not None:
-            if macd_line > 0:
-                score += 20
-            if macd_line < -0.0001:
-                score -= 20
-            if macd_hist is not None and macd_hist > 0:
-                score += 5
-        # Stochastic
+            if macd_line > macd_signal:
+                if macd_hist is not None and abs(macd_hist) > 0.001:
+                    score += 20
+                else:
+                    score += 10
+            elif macd_line < macd_signal - 0.01:
+                score -= 15
+        # Stochastic: 극단 가중, 중립 감점
         if stoch_k is not None and stoch_d is not None:
-            if stoch_k < 30:
+            if stoch_k < 20:
+                score += 15
+            elif stoch_k < 30:
                 score += 10
-            elif stoch_k > 70:
+            elif 30 <= stoch_k <= 70:
                 score -= 5
+            elif stoch_k > 80:
+                score -= 10
             # K-D 상향 크로스
             if stoch_k > stoch_d:
                 score += 8
         # ADX
-        if adx is not None:
-            if adx < 20:
-                score -= 15
-            elif adx < 25:
-                score += 0
-            elif adx < 35:
-                score += 5
-            else:
-                score += 10
+        if adx is None or adx < 20:
+            score -= 15
+        elif adx < 25:
+            score += 0
+        elif adx < 35:
+            score += 5
+        else:
+            score += 10
         # EMA 크로스 신선도
         if ema_cross_recent:
             score += 25
@@ -422,9 +426,9 @@ class ScalpingStrategy:
         plus_di = regime_ctx.get("plus_di") if regime_ctx else None
         minus_di = regime_ctx.get("minus_di") if regime_ctx else None
 
-        # ADX 기반 약추세 필터(거래 강도 조정용): adx<20이면 진입 스킵
-        if adx_val is not None and adx_val < 20:
-            logger.debug(f"[{symbol}] ADX 약함({adx_val:.1f}) - 진입 스킵")
+        # ADX 기반 약추세 필터(거래 강도 조정용): ADX가 없거나 20 미만이면 스킵
+        if adx_val is None or adx_val < 20:
+            logger.debug(f"[{symbol}] ADX 없음/약함({adx_val}) - 진입 스킵")
             return None
 
         macd_line = ind.get("macd_line")
@@ -493,8 +497,8 @@ class ScalpingStrategy:
             ema_cross_bars=regime_ctx.get("ema_cross_bars") if regime_ctx else None,
             volume_spike=vol_confirmed and len(volumes) >= 2 and base_vol is not None and base_vol > 0 and volumes[-1] >= base_vol * 2.0,
         )
-        if entry_score < 50:
-            logger.debug(f"[{symbol}] 스코어 부족: {entry_score:.1f} < 50")
+        if entry_score < 60:
+            logger.debug(f"[{symbol}] 스코어 부족: {entry_score:.1f} < 60")
             return None
 
         # ===== Regime-based entry logic =====
@@ -536,11 +540,12 @@ class ScalpingStrategy:
             
             # Additional safety: require some bounce momentum (price slightly above BB lower)
             bounce_started = current_price > bb_lower * 1.001
-            # 거래량 스파이크로 바닥 확인 (기본 multiplier보다 엄격)
+            # 거래량 스파이크로 바닥 확인 (전용 multiplier)
             vol_spike = False
+            downtrend_volume_multiplier = 2.0
             if base_vol and base_vol > 0:
-                vol_spike = volumes[-1] >= base_vol * max(2.0, self.volume_confirm_multiplier)
-            # RSI 반등 시작 여부 (직전 RSI 대비 상승)
+                vol_spike = volumes[-1] >= base_vol * downtrend_volume_multiplier
+            # RSI 반등 시작 여부 (직전 RSI 대비 상승폭 확인)
             rsi_prev = None
             try:
                 rsi_series = calculate_rsi(close_prices, self.rsi_period)
@@ -548,7 +553,9 @@ class ScalpingStrategy:
                     rsi_prev = float(rsi_series[-2])
             except Exception:
                 rsi_prev = None
-            rsi_turn = rsi_prev is not None and rsi > rsi_prev
+            rsi_turn = False
+            if rsi_prev is not None:
+                rsi_turn = (rsi <= 30 and rsi > rsi_prev) or (rsi > rsi_prev + 2.0)
             # MACD 히스토그램 상승 확인
             macd_bounce_ok = macd_hist is not None and macd_hist > 0
 
@@ -558,7 +565,10 @@ class ScalpingStrategy:
                 f"거래량스파이크={vol_spike}, RSI턴={rsi_turn}, MACD턴={macd_bounce_ok}"
             )
 
-            if ema_trend == -1 and oversold_bounce and at_bb_lower and bounce_started and vol_spike and rsi_turn and macd_bounce_ok:
+            essential = ema_trend == -1 and oversold_bounce and at_bb_lower
+            momentum_score = int(bounce_started) + int(vol_spike) + int(rsi_turn) + int(macd_bounce_ok)
+
+            if essential and momentum_score >= 2:
                 reason = (
                     f"SCALP LONG (DOWNTREND BOUNCE): oversold reversal, "
                     f"price={current_price:.2f}, BB_lower={bb_lower:.2f}, "

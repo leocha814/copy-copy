@@ -305,9 +305,6 @@ class ScalpingBot:
         account_state = await self._get_account_state()
         breached = self.risk_manager.check_all_limits(account_state)
         if breached:
-            logger.warning("⚠️ 리스크 한도 초과 - 새 진입 중단")
-            if self.alerts:
-                await self.alerts.send_message("⚠️ 리스크 한도 초과 - 진입 중단")
             return
 
         # Process each symbol
@@ -579,30 +576,25 @@ class ScalpingBot:
             return
 
         # 주문할 돈이 없으면 진입 스킵
-        try:
-            balance_raw = await asyncio.wait_for(
-                self.exchange.fetch_balance(),
-                timeout=10.0
-            )
-            # KRW 잔액 추출
-            if isinstance(balance_raw, dict):
-                if 'KRW' in balance_raw and isinstance(balance_raw['KRW'], dict):
-                    krw_balance = float(balance_raw['KRW'].get('free', 0.0))
-                elif 'total' in balance_raw and isinstance(balance_raw['total'], dict):
-                    krw_balance = float(balance_raw['total'].get('KRW', 0.0))
-                else:
-                    krw_balance = 0.0
-            else:
-                krw_balance = 0.0
-            
-            if krw_balance <= 0:
-                logger.debug(f"[{symbol}] 주문할 KRW 잔액 부족: {krw_balance} - 진입 스킵")
-                return
-        except asyncio.TimeoutError:
-            logger.warning(f"[{symbol}] 잔액 조회 타임아웃 - 진입 스킵")
-            return
-        except Exception as e:
-            logger.warning(f"[{symbol}] 잔액 조회 실패: {e} - 진입 스킵")
+        async def _fetch_krw_balance():
+            try:
+                balance_raw_local = await asyncio.wait_for(
+                    self.exchange.fetch_balance(),
+                    timeout=10.0
+                )
+                if isinstance(balance_raw_local, dict):
+                    if 'KRW' in balance_raw_local and isinstance(balance_raw_local['KRW'], dict):
+                        return float(balance_raw_local['KRW'].get('free', 0.0))
+                    if 'total' in balance_raw_local and isinstance(balance_raw_local['total'], dict):
+                        return float(balance_raw_local['total'].get('KRW', 0.0))
+                return 0.0
+            except Exception as e:
+                logger.warning(f"[{symbol}] 잔액 조회 실패: {e} - 진입 스킵")
+                return 0.0
+
+        krw_balance = await _fetch_krw_balance()
+        if krw_balance <= 0:
+            logger.debug(f"[{symbol}] 주문할 KRW 잔액 부족: {krw_balance} - 진입 스킵")
             return
 
         signal = self.scalping_strategy.generate_entry_signal(
@@ -666,22 +658,6 @@ class ScalpingBot:
             entry_side=signal.side,
             atr_value=atr_value,
         )
-        # 점수 기반 SL/TP 조정 (옵션)
-        score = getattr(signal, "score", None)
-        try:
-            if score is not None:
-                if score < 60:
-                    stop_loss, take_profit = (
-                        current_price * 0.9975,
-                        current_price * 1.0025,
-                    )
-                elif score >= 75:
-                    stop_loss, take_profit = (
-                        current_price * 0.9985,
-                        current_price * 1.0040,
-                    )
-        except Exception:
-            pass
 
         # 사전 수익성 체크
         if not self.scalping_strategy.passes_profitability_check(
@@ -735,6 +711,12 @@ class ScalpingBot:
         # Execute order with timeout and validation
         # order_router.execute_signal은 내부에서 실시간 잔액을 100% 사용 (size=None)
         try:
+            # 진입 직전에 잔액 재확인
+            krw_balance = await _fetch_krw_balance()
+            if krw_balance <= 0:
+                logger.warning(f"[{symbol}] 주문 직전 KRW 부족: {krw_balance} - 진입 스킵")
+                return
+
             order_result = await asyncio.wait_for(
                 self.order_router.execute_signal(
                     signal=signal,
@@ -889,24 +871,24 @@ class ScalpingBot:
         if should_exit:
             logger.info(f"[{symbol}] 🔔 청산 신호: {exit_reason}")
 
-            # 청산 전: 펀딩 청산 주문이 이미 있는지 확인
+            # 청산 전: 펀딩 청산 주문이 이미 있는지 확인 (실패 시 이번 루프 건너뜀)
             try:
                 open_orders = await asyncio.wait_for(
                     self.exchange.fetch_open_orders(symbol),
                     timeout=10.0
                 )
             except asyncio.TimeoutError:
-                logger.warning(f"[{symbol}] 오픈 주문 조회 타임아웃 - 청산 진행")
-                open_orders = []
+                logger.error(f"[{symbol}] 오픈 주문 조회 타임아웃 - 이번 루프 청산 건너뜀")
+                return
             except Exception as e:
-                logger.warning(f"[{symbol}] 오픈 주문 조회 실패: {e} - 청산 진행")
-                open_orders = []
-            
+                logger.error(f"[{symbol}] 오픈 주문 조회 실패: {e} - 이번 루프 청산 건너뜀")
+                return
+
             # 반대 방향 주문이 이미 있으면 대기
             close_side = OrderSide.SELL if position.side == OrderSide.BUY else OrderSide.BUY
             for order in open_orders:
                 order_side = order.get("side", "").upper()
-                order_status = order.get("status", "")
+                order_status = str(order.get("status", "")).lower()
                 if order_side == close_side.value.upper() and order_status not in ["closed", "canceled"]:
                     logger.info(f"[{symbol}] 펀딩 청산 주문 이미 있음 (ID: {order.get('id')}) - 대기")
                     return
@@ -957,21 +939,36 @@ class ScalpingBot:
                 logger.warning(f"[{symbol}] 청산 주문 체결 없음 (status={order_status}) - 다음 루프 재시도")
                 return
             
-            # 부분 체결 또는 전체 체결 처리
-            if filled_amount < position.size:
-                logger.warning(
-                    f"[{symbol}] 부분 청산: {filled_amount:.8f} / {position.size:.8f} "
-                    f"(status={order_status})"
-                )
-            
             exit_price = close_result.get("average", float(candles[-1].close))
             
-            # position_tracker에서 filled 수량만 닫기 (부분 청산 지원)
+            # 전량 청산 원칙: 부분 체결 시 즉시 나머지 재청산 시도
+            remaining_size = position.size - filled_amount
+            if remaining_size > 0:
+                logger.warning(
+                    f"[{symbol}] 부분 청산: {filled_amount:.8f} / {position.size:.8f} (status={order_status}) - 잔여 청산 재시도"
+                )
+                try:
+                    retry_result = await asyncio.wait_for(
+                        self.order_router.close_position(
+                            symbol=symbol,
+                            side=position.side,
+                            size=remaining_size,
+                            reason="Partial close remainder",
+                        ),
+                        timeout=60.0
+                    )
+                    if retry_result:
+                        filled_amount += float(retry_result.get("filled", 0.0))
+                        exit_price = retry_result.get("average", exit_price)
+                except Exception as e:
+                    logger.warning(f"[{symbol}] 부분 청산 잔여 재시도 실패: {e}")
+
+            # position_tracker에서 실제 체결 수량만 닫기
             trade = self.position_tracker.close_position(
                 symbol=symbol,
                 exit_price=exit_price,
                 fees=None,  # exit_fees는 order result의 수수료 사용
-                filled_amount=filled_amount,  # 실제 체결량 전달
+                filled_amount=filled_amount,
             )
 
             if not trade:
