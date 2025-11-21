@@ -302,16 +302,17 @@ def validate_risk_config(config: RiskConfig) -> None:
     # Percentage validations
     if not (0.1 <= config.per_trade_risk_pct <= 100.0):
         errors.append(f"PER_TRADE_RISK must be between 0.1-100.0%, got {config.per_trade_risk_pct}%")
-    if not (1.0 <= config.max_daily_loss_pct <= 50.0):
-        errors.append(f"MAX_DAILY_LOSS must be between 1.0-50.0%, got {config.max_daily_loss_pct}%")
-    if not (5.0 <= config.max_drawdown_pct <= 100.0):
-        errors.append(f"MAX_DRAWDOWN must be between 5.0-100.0%, got {config.max_drawdown_pct}%")
+    # 상한을 넓혀 전체 잔액 매매 플로우가 리스크 검증에서 막히지 않도록 허용
+    if config.max_daily_loss_pct < 0.0:
+        errors.append(f"MAX_DAILY_LOSS must be >= 0.0%, got {config.max_daily_loss_pct}%")
+    if config.max_drawdown_pct < 0.0:
+        errors.append(f"MAX_DRAWDOWN must be >= 0.0%, got {config.max_drawdown_pct}%")
     if not (10.0 <= config.max_position_size_pct <= 100.0):
         errors.append(f"MAX_POSITION_SIZE must be between 10.0-100.0%, got {config.max_position_size_pct}%")
     
     # Consecutive losses validation
-    if not (1 <= config.max_consecutive_losses <= 20):
-        errors.append(f"MAX_CONSECUTIVE_LOSSES must be between 1-20, got {config.max_consecutive_losses}")
+    if config.max_consecutive_losses < 0:
+        errors.append(f"MAX_CONSECUTIVE_LOSSES must be >= 0, got {config.max_consecutive_losses}")
     
     # ATR multiplier validation
     if not (0.5 <= config.stop_atr_multiplier <= 10.0):
@@ -322,7 +323,7 @@ def validate_risk_config(config: RiskConfig) -> None:
         errors.append(f"TARGET_ATR_MULTIPLIER ({config.target_atr_multiplier}) must be > STOP_ATR_MULTIPLIER ({config.stop_atr_multiplier})")
     
     # Logical validations (skip for full-in mode: PER_TRADE_RISK=100%)
-    if config.per_trade_risk_pct <= 100.0 and config.per_trade_risk_pct > config.max_daily_loss_pct:
+    if config.per_trade_risk_pct <= 100.0 and config.max_daily_loss_pct > 0 and config.per_trade_risk_pct > config.max_daily_loss_pct:
         errors.append(f"PER_TRADE_RISK ({config.per_trade_risk_pct}%) should be <= MAX_DAILY_LOSS ({config.max_daily_loss_pct}%)")
     
     if errors:

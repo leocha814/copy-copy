@@ -13,7 +13,7 @@ Main entry point for scalping mode with:
 import asyncio
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from src.app.config import load_config
@@ -57,7 +57,10 @@ class ScalpingBot:
         # Initialize exchange
         if self.config.dry_run:
             logger.info("드라이런: 종이거래소 사용")
-            self.exchange = PaperExchange(initial_balance=self.config.initial_balance)
+            self.exchange = PaperExchange(
+                initial_balance=self.config.initial_balance,
+                symbols=self.config.strategy.symbols,
+            )
         else:
             self.exchange = UpbitExchange(
                 api_key=self.config.exchange.api_key,
@@ -280,7 +283,8 @@ class ScalpingBot:
                 logger.error(f"❌ Error processing {symbol}: {e}", exc_info=True)
 
         # Summary log per loop
-        self._log_summary(account_state)
+        final_state = await self._get_account_state(force_exchange_fetch=True)
+        self._log_summary(final_state)
 
     async def _process_symbol(self, symbol: str):
         """Process trading logic for one symbol."""
@@ -927,3 +931,96 @@ class ScalpingBot:
                 logger.info(f"💰 청산 후 실제 잔고 업데이트: {actual_balance:,.0f} KRW")
             except Exception as e:
                 logger.warning(f"청산 후 잔고 업데이트 실패: {e}")
+
+    async def _get_account_state(self, force_exchange_fetch: bool = False) -> AccountState:
+        """Get current account state (Upbit 호환 파서 포함)."""
+        def _parse_upbit_balance(bal_raw):
+            """
+            Upbit REST (accounts) 또는 CCXT 포맷에서 KRW 총액/가용액을 추출.
+            - REST 예: [{'currency': 'KRW', 'balance': '1000', 'locked': '0', ...}]
+            - CCXT 예: {'KRW': {'free': .., 'used': .., 'total': ..}, 'free': {...}, 'total': {...}}
+            """
+            total = 0.0
+            free = 0.0
+            try:
+                if isinstance(bal_raw, list):
+                    for item in bal_raw:
+                        if isinstance(item, dict) and item.get("currency") == "KRW":
+                            bal = float(item.get("balance", 0) or 0)
+                            locked = float(item.get("locked", 0) or 0)
+                            total = bal + locked
+                            free = bal
+                            return total, free
+                if isinstance(bal_raw, dict):
+                    if "KRW" in bal_raw and isinstance(bal_raw["KRW"], dict):
+                        krw = bal_raw["KRW"]
+                        total = float(krw.get("total", krw.get("free", 0.0)) or 0.0)
+                        free = float(krw.get("free", total) or 0.0)
+                        return total, free
+                    if "total" in bal_raw and isinstance(bal_raw["total"], dict):
+                        total = float(bal_raw["total"].get("KRW", 0.0) or 0.0)
+                    if "free" in bal_raw and isinstance(bal_raw["free"], dict):
+                        free = float(bal_raw["free"].get("KRW", total) or 0.0)
+                    if total or free:
+                        return total, free
+            except Exception:
+                pass
+            return 0.0, 0.0
+
+        try:
+            balance_raw = await self.exchange.fetch_balance()
+            total_balance, available_balance = _parse_upbit_balance(balance_raw)
+            if total_balance <= 0:
+                total_balance = self.session_start_balance
+            if available_balance <= 0:
+                available_balance = total_balance
+        except Exception:
+            total_balance = self.session_start_balance
+            available_balance = self.session_start_balance
+
+        # Calculate equity
+        unrealized_pnl = 0.0
+        for symbol in self.config.strategy.symbols:
+            pos = self.position_tracker.get_position(symbol)
+            if pos:
+                unrealized_pnl += pos.unrealized_pnl
+
+        # 현재 포지션 가치(원화 환산)를 포함한 자산 계산
+        position_value = 0.0
+        for symbol in self.config.strategy.symbols:
+            pos = self.position_tracker.get_position(symbol)
+            if pos:
+                mark_price = pos.current_price or pos.entry_price
+                position_value += mark_price * pos.size
+
+        equity = total_balance + position_value + unrealized_pnl
+        if self.peak_balance < equity:
+            self.peak_balance = equity
+
+        return AccountState(
+            # UTC 타임스탬프는 timezone-aware 객체로 저장
+            timestamp=datetime.now(timezone.utc),
+            total_balance=total_balance,
+            available_balance=available_balance,  # 자유 KRW 잔고
+            equity=equity,
+            daily_pnl=self.daily_pnl,
+            total_pnl=self.daily_pnl,  # 누적 손익 데이터가 없으므로 일간 손익으로 대체
+            open_positions=len(self.position_tracker.get_all_positions()),
+            consecutive_losses=self.consecutive_losses,
+            max_equity=self.peak_balance if self.peak_balance > 0 else equity,
+        )
+
+    def _log_summary(self, account_state: AccountState):
+        """Log account summary for this iteration."""
+        logger.info(
+            f"📊 계정 요약: 잔고={account_state.total_balance:,.0f} KRW | "
+            f"자산={account_state.equity:,.0f} KRW | "
+            f"미실현손익={(account_state.equity - account_state.total_balance):+,.0f} KRW | "
+            f"일간손익={self.daily_pnl:+,.0f} KRW | "
+            f"낙폭={account_state.current_drawdown_pct:.2f}%"
+        )
+
+
+if __name__ == "__main__":
+    bot = ScalpingBot()
+    asyncio.run(bot.run())
