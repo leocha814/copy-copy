@@ -46,6 +46,17 @@ TIMEFRAME=1m
 DRY_RUN=true           # 실거래 시 false
 DEFAULT_ORDER_TYPE=market
 PREFER_MAKER=false     # 메이커 우선 사용 시 true
+# 추세 추격 모드: 항상 ON (설정 없음)
+TREND_RSI_MIN=60
+TREND_BB_POS_MIN=60
+TREND_PRICE_ABOVE_EMA_PCT=0.3
+TREND_VOLUME_MULTIPLIER=2.0
+BB_WIDTH_MIN=0.5
+BB_WIDTH_MAX=8.0
+VOLUME_CONFIRM_MULTIPLIER=1.5
+MIN_EXPECTED_RR=0.5
+FEE_RATE_PCT=0.10
+SLIPPAGE_BUFFER_PCT=0.25
 ```
 > ⚠️ **API Key 보안**: 키는 .env로 관리하고 .gitignore에 포함하세요.
 
@@ -67,6 +78,8 @@ python -m src.app.scalping_bot
   - 거래량: 최근 봉 거래량 ≥ 과거 `volume_lookback` 평균 × `volume_confirm_multiplier`
 - 수익성: 예상 TP/SL 대비 수수료(fee_rate_pct) + 슬리피지 버퍼(slippage_buffer_pct) 반영 후 `min_expected_rr` 이상일 때만 진입
 - 쿨다운/횟수 제한: 심볼별 `entry_cooldown_seconds`, `max_entries_per_hour` 적용
+- **추세 추격 모드**: 상승장에서 모멘텀 돌파 진입(항상 활성화)
+  - 조건: RSI ≥ `trend_rsi_min`, BB 포지션 ≥ `trend_bb_pos_min`, 가격이 EMA_fast 대비 `trend_price_above_ema_pct` 이상 상회, 거래량 `trend_volume_multiplier` 배 이상
 
 ### 5-2. 청산 조건 (100% 매도)
 - 고정 SL/TP 또는 ATR 기반 SL/TP 도달 시 전량 청산

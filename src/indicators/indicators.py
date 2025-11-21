@@ -127,6 +127,54 @@ def calculate_adx(
     return adx.values, plus_di.values, minus_di.values
 
 
+def calculate_macd(
+    prices: List[float],
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return MACD line, signal line, histogram."""
+    if len(prices) < slow_period + signal_period:
+        empty = np.full(len(prices), np.nan)
+        return empty, empty, empty
+
+    series = pd.Series(prices, dtype=float)
+    ema_fast = series.ewm(span=fast_period, adjust=False).mean()
+    ema_slow = series.ewm(span=slow_period, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line.values, signal_line.values, histogram.values
+
+
+def calculate_stochastic(
+    high: List[float],
+    low: List[float],
+    close: List[float],
+    period: int = 14,
+    smooth_k: int = 3,
+    smooth_d: int = 3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return Stochastic K, D."""
+    if len(high) < period or len(low) < period or len(close) < period:
+        empty = np.full(len(close), np.nan)
+        return empty, empty
+
+    high_series = pd.Series(high, dtype=float)
+    low_series = pd.Series(low, dtype=float)
+    close_series = pd.Series(close, dtype=float)
+
+    lowest_low = low_series.rolling(window=period).min()
+    highest_high = high_series.rolling(window=period).max()
+    denom = (highest_high - lowest_low).replace(0.0, np.nan)
+
+    raw_k = 100.0 * (close_series - lowest_low) / denom
+    k_line = raw_k.rolling(window=smooth_k).mean()
+    d_line = k_line.rolling(window=smooth_d).mean()
+
+    return k_line.values, d_line.values
+
+
 def calculate_bb_position(
     price: float,
     upper: float,

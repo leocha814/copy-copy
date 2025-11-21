@@ -142,6 +142,26 @@ class OrderRouter:
                 logger.error("No valid price from ticker for %s", signal.symbol)
                 return None
 
+            # 사전 슬리피지 추정(스프레드 기반)
+            bid = ticker.get("bid")
+            ask = ticker.get("ask")
+            if bid and ask:
+                try:
+                    bid_v = float(bid)
+                    ask_v = float(ask)
+                    if bid_v > 0 and ask_v > 0:
+                        spread_pct = ((ask_v - bid_v) / ((ask_v + bid_v) / 2)) * 100.0
+                        if spread_pct > self.max_slippage_pct:
+                            logger.warning(
+                                "Pre-check slippage %.4f%% > max %.4f%% for %s -- skip order",
+                                spread_pct,
+                                self.max_slippage_pct,
+                                signal.symbol,
+                            )
+                            return None
+                except Exception:
+                    pass
+
             # Choose limit price with small edge (configurable if needed)
             if signal.side == OrderSide.BUY:
                 raw_limit_price = current_price * 0.999  # slightly below
@@ -244,11 +264,12 @@ class OrderRouter:
 
         if abs(slippage) > self.max_slippage_pct:
             logger.warning(
-                "High slippage: %.4f%% > %.4f%% for %s",
+                "High slippage: %.4f%% > %.4f%% for %s -- entry aborted",
                 slippage,
                 self.max_slippage_pct,
                 signal.symbol,
             )
+            return None
 
         # Note: stop_loss / take_profit 실제 주문(조건부/OTO)은
         # 별도 Risk/Execution 모듈에서 처리하는 것을 권장.

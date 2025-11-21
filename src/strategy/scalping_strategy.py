@@ -10,6 +10,7 @@ Characteristics:
 """
 
 import math
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -24,6 +25,8 @@ from src.indicators.indicators import (
     calculate_ema,
     calculate_bb_width,
     calculate_bb_position,
+    calculate_macd,
+    calculate_stochastic,
 )
 from src.monitor.logger import logger
 
@@ -98,6 +101,11 @@ class ScalpingStrategy:
         # Fixed stops (percentage) - IMPROVED
         fixed_stop_loss_pct: float = 0.20,  # Increased from 0.15
         fixed_take_profit_pct: float = 0.35,  # Increased from 0.25
+        # Trend chase parameters
+        trend_rsi_min: float = 60.0,
+        trend_bb_pos_min: float = 60.0,
+        trend_price_above_ema_pct: float = 0.3,
+        trend_volume_multiplier: float = 2.0,
         use_atr_sl_tp: bool = False,
         atr_stop_multiplier: float = 0.5,
         atr_target_multiplier: float = 1.0,
@@ -136,6 +144,10 @@ class ScalpingStrategy:
 
         self.fixed_stop_loss_pct = fixed_stop_loss_pct
         self.fixed_take_profit_pct = fixed_take_profit_pct
+        self.trend_rsi_min = trend_rsi_min
+        self.trend_bb_pos_min = trend_bb_pos_min
+        self.trend_price_above_ema_pct = trend_price_above_ema_pct
+        self.trend_volume_multiplier = trend_volume_multiplier
         self.use_atr_sl_tp = use_atr_sl_tp
         self.atr_stop_multiplier = atr_stop_multiplier
         self.atr_target_multiplier = atr_target_multiplier
@@ -274,6 +286,62 @@ class ScalpingStrategy:
             "price": current_price,
         }
 
+    def _calculate_entry_score(
+        self,
+        *,
+        macd_line: Optional[float],
+        macd_signal: Optional[float],
+        macd_hist: Optional[float],
+        stoch_k: Optional[float],
+        stoch_d: Optional[float],
+        adx: Optional[float],
+        ema_cross_recent: bool = False,
+        ema_cross_bars: Optional[int] = None,
+        volume_spike: bool = False,
+    ) -> float:
+        score = 50.0
+        # MACD
+        if macd_line is not None and macd_signal is not None:
+            if macd_line > 0:
+                score += 20
+            if macd_line < -0.0001:
+                score -= 20
+            if macd_hist is not None and macd_hist > 0:
+                score += 5
+        # Stochastic
+        if stoch_k is not None and stoch_d is not None:
+            if stoch_k < 30:
+                score += 10
+            elif stoch_k > 70:
+                score -= 5
+            # K-D 상향 크로스
+            if stoch_k > stoch_d:
+                score += 8
+        # ADX
+        if adx is not None:
+            if adx < 20:
+                score -= 15
+            elif adx < 25:
+                score += 0
+            elif adx < 35:
+                score += 5
+            else:
+                score += 10
+        # EMA 크로스 신선도
+        if ema_cross_recent:
+            score += 25
+        elif ema_cross_bars is not None:
+            if 1 <= ema_cross_bars <= 3:
+                score += 15
+            elif 4 <= ema_cross_bars <= 7:
+                score += 5
+        # 거래량 스파이크
+        if volume_spike:
+            score += 15
+
+        # 클램프 0~100
+        return max(0.0, min(100.0, score))
+
     # ===== Entry Signal Generation =====
 
     def generate_entry_signal(
@@ -310,6 +378,8 @@ class ScalpingStrategy:
         try:
             close_prices = [float(c.close) for c in candles]
             volumes = [float(c.volume) for c in candles]
+            highs = [float(c.high) for c in candles]
+            lows = [float(c.low) for c in candles]
         except Exception:
             return None
 
@@ -322,6 +392,22 @@ class ScalpingStrategy:
         if ind is None:
             return None
 
+        # 추가 모멘텀 지표(MACD, Stochastic)
+        try:
+            macd_line, macd_signal, macd_hist = calculate_macd(close_prices)
+            stoch_k, stoch_d = calculate_stochastic(highs, lows, close_prices)
+            ind.update(
+                {
+                    "macd_line": float(macd_line[-1]) if len(macd_line) else None,
+                    "macd_signal": float(macd_signal[-1]) if len(macd_signal) else None,
+                    "macd_hist": float(macd_hist[-1]) if len(macd_hist) else None,
+                    "stoch_k": float(stoch_k[-1]) if len(stoch_k) else None,
+                    "stoch_d": float(stoch_d[-1]) if len(stoch_d) else None,
+                }
+            )
+        except Exception:
+            pass
+
         rsi = ind["rsi"]
         bb_upper = ind["bb_upper"]
         bb_middle = ind["bb_middle"]
@@ -331,6 +417,21 @@ class ScalpingStrategy:
         ema_fast = ind["ema_fast"]
         ema_slow = ind["ema_slow"]
         ema_trend = ind["ema_trend"]
+
+        adx_val = regime_ctx.get("adx") if regime_ctx else None
+        plus_di = regime_ctx.get("plus_di") if regime_ctx else None
+        minus_di = regime_ctx.get("minus_di") if regime_ctx else None
+
+        # ADX 기반 약추세 필터(거래 강도 조정용): adx<20이면 진입 스킵
+        if adx_val is not None and adx_val < 20:
+            logger.debug(f"[{symbol}] ADX 약함({adx_val:.1f}) - 진입 스킵")
+            return None
+
+        macd_line = ind.get("macd_line")
+        macd_signal = ind.get("macd_signal")
+        macd_hist = ind.get("macd_hist")
+        stoch_k = ind.get("stoch_k")
+        stoch_d = ind.get("stoch_d")
 
         # Entry guard: 깊은 밴드 + RSI 범위
         if bb_position is None or bb_position > self.bb_pos_entry_max:
@@ -342,6 +443,7 @@ class ScalpingStrategy:
 
         # 거래량 확인: 최근 거래량이 평균 대비 충분히 높을 때만 진입
         vol_confirmed = True
+        base_vol = None
         if len(volumes) >= self.volume_lookback:
             recent_vol = volumes[-1]
             base_vol = statistics.mean(volumes[-self.volume_lookback : -1])
@@ -375,8 +477,25 @@ class ScalpingStrategy:
         logger.debug(
             f"[{symbol}] 지표: RSI={rsi:.1f}, BB폭={bb_width_pct:.2f}%, "
             f"BB포지션={bb_position if bb_position is not None else 'N/A'}, "
-            f"EMA_fast={ema_fast:.2f}, EMA_slow={ema_slow:.2f}, 가격={current_price:.2f}"
+            f"EMA_fast={ema_fast:.2f}, EMA_slow={ema_slow:.2f}, 가격={current_price:.2f}, "
+            f"ADX={adx_val if adx_val is not None else 'N/A'}"
         )
+
+        # 스코어 계산 (0-100)
+        entry_score = self._calculate_entry_score(
+            macd_line=macd_line,
+            macd_signal=macd_signal,
+            macd_hist=macd_hist,
+            stoch_k=stoch_k,
+            stoch_d=stoch_d,
+            adx=adx_val,
+            ema_cross_recent=regime_ctx.get("ema_cross_recent") if regime_ctx else False,
+            ema_cross_bars=regime_ctx.get("ema_cross_bars") if regime_ctx else None,
+            volume_spike=vol_confirmed and len(volumes) >= 2 and base_vol is not None and base_vol > 0 and volumes[-1] >= base_vol * 2.0,
+        )
+        if entry_score < 50:
+            logger.debug(f"[{symbol}] 스코어 부족: {entry_score:.1f} < 50")
+            return None
 
         # ===== Regime-based entry logic =====
 
@@ -404,6 +523,7 @@ class ScalpingStrategy:
                     reason=reason,
                     regime=regime,
                     indicators=ind,
+                    score=entry_score,
                     executed=False,
                 )
 
@@ -411,18 +531,34 @@ class ScalpingStrategy:
         # NOTE: Upbit doesn't support SHORT, so we trade bounces instead
         elif regime == MarketRegime.DOWNTREND and self.enable_downtrend_bounce_longs:
             # Entry: Oversold bounce (RSI < 30, BB lower band touch)
-            oversold_bounce = rsi <= self.rsi_oversold
+            oversold_bounce = rsi <= max(25.0, self.rsi_oversold)
             at_bb_lower = bb_position is not None and bb_position < -40
             
             # Additional safety: require some bounce momentum (price slightly above BB lower)
             bounce_started = current_price > bb_lower * 1.001
+            # 거래량 스파이크로 바닥 확인 (기본 multiplier보다 엄격)
+            vol_spike = False
+            if base_vol and base_vol > 0:
+                vol_spike = volumes[-1] >= base_vol * max(2.0, self.volume_confirm_multiplier)
+            # RSI 반등 시작 여부 (직전 RSI 대비 상승)
+            rsi_prev = None
+            try:
+                rsi_series = calculate_rsi(close_prices, self.rsi_period)
+                if rsi_series is not None and len(rsi_series) >= 2:
+                    rsi_prev = float(rsi_series[-2])
+            except Exception:
+                rsi_prev = None
+            rsi_turn = rsi_prev is not None and rsi > rsi_prev
+            # MACD 히스토그램 상승 확인
+            macd_bounce_ok = macd_hist is not None and macd_hist > 0
 
             logger.debug(
                 f"[{symbol}] 하락장 바운스 조건 | RSI과매도={oversold_bounce}, "
-                f"BB하단접근={at_bb_lower}, 반등시작={bounce_started}"
+                f"BB하단접근={at_bb_lower}, 반등시작={bounce_started}, "
+                f"거래량스파이크={vol_spike}, RSI턴={rsi_turn}, MACD턴={macd_bounce_ok}"
             )
 
-            if ema_trend == -1 and oversold_bounce and at_bb_lower and bounce_started:
+            if ema_trend == -1 and oversold_bounce and at_bb_lower and bounce_started and vol_spike and rsi_turn and macd_bounce_ok:
                 reason = (
                     f"SCALP LONG (DOWNTREND BOUNCE): oversold reversal, "
                     f"price={current_price:.2f}, BB_lower={bb_lower:.2f}, "
@@ -435,6 +571,7 @@ class ScalpingStrategy:
                     reason=reason,
                     regime=regime,
                     indicators=ind,
+                    score=entry_score,
                     executed=False,
                 )
 
@@ -462,6 +599,7 @@ class ScalpingStrategy:
                     reason=reason,
                     regime=regime,
                     indicators=ind,
+                    score=entry_score,
                     executed=False,
                 )
 

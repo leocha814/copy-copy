@@ -106,6 +106,10 @@ class ScalpingBot:
             min_expected_rr=self.config.strategy.min_expected_rr,
             fee_rate_pct=self.config.strategy.fee_rate_pct,
             slippage_buffer_pct=self.config.strategy.slippage_buffer_pct,
+            trend_rsi_min=self.config.strategy.trend_rsi_min,
+            trend_bb_pos_min=self.config.strategy.trend_bb_pos_min,
+            trend_price_above_ema_pct=self.config.strategy.trend_price_above_ema_pct,
+            trend_volume_multiplier=self.config.strategy.trend_volume_multiplier,
         )
 
         limits = RiskLimits(
@@ -188,6 +192,22 @@ class ScalpingBot:
             MarketRegime.UNKNOWN: "알수없음",
         }
         return mapping.get(regime, str(regime))
+
+    async def _calc_balance_size(self, current_price: float) -> float:
+        """KRW 잔액 기준 100% 포지션 크기 계산."""
+        try:
+            balance_raw = await self.exchange.fetch_balance()
+            krw_balance = 0.0
+            if isinstance(balance_raw, dict):
+                if 'KRW' in balance_raw and isinstance(balance_raw['KRW'], dict):
+                    krw_balance = float(balance_raw['KRW'].get('free', 0.0))
+                elif 'total' in balance_raw and isinstance(balance_raw['total'], dict):
+                    krw_balance = float(balance_raw['total'].get('KRW', 0.0))
+            if current_price > 0:
+                return krw_balance / current_price
+        except Exception:
+            return 0.0
+        return 0.0
 
     async def run(self):
         """Main scalping bot loop."""
@@ -646,6 +666,22 @@ class ScalpingBot:
             entry_side=signal.side,
             atr_value=atr_value,
         )
+        # 점수 기반 SL/TP 조정 (옵션)
+        score = getattr(signal, "score", None)
+        try:
+            if score is not None:
+                if score < 60:
+                    stop_loss, take_profit = (
+                        current_price * 0.9975,
+                        current_price * 1.0025,
+                    )
+                elif score >= 75:
+                    stop_loss, take_profit = (
+                        current_price * 0.9985,
+                        current_price * 1.0040,
+                    )
+        except Exception:
+            pass
 
         # 사전 수익성 체크
         if not self.scalping_strategy.passes_profitability_check(
@@ -660,13 +696,49 @@ class ScalpingBot:
             f"[{symbol}] 손절: {stop_loss:.2f} | 익절: {take_profit:.2f}"
         )
 
+        # 포지션 사이징: 기본 100%, ATR 리스크 기반 옵션
+        order_size = None
+        # 점수 기반 사이징(옵션): 기본 100%, score<60이면 축소
+        score = None
+        try:
+            score = float(getattr(signal, "score", None)) if signal is not None else None
+        except Exception:
+            score = None
+
+        if self.config.strategy.use_score_based_sizing and score is not None:
+            if score < 50:
+                logger.debug(f"[{symbol}] 스코어<{50} 진입 스킵")
+                return
+            elif score < 60:
+                order_size = (await self._calc_balance_size(current_price)) * 0.5
+            elif score < 70:
+                order_size = (await self._calc_balance_size(current_price)) * 0.75
+            else:
+                order_size = None  # 100%
+        elif self.config.strategy.use_atr_position_sizing:
+            # 계좌 잔액과 리스크 퍼센트 사용
+            try:
+                balance_raw = await self.exchange.fetch_balance()
+                krw_balance = 0.0
+                if isinstance(balance_raw, dict):
+                    if 'KRW' in balance_raw and isinstance(balance_raw['KRW'], dict):
+                        krw_balance = float(balance_raw['KRW'].get('free', 0.0))
+                    elif 'total' in balance_raw and isinstance(balance_raw['total'], dict):
+                        krw_balance = float(balance_raw['total'].get('KRW', 0.0))
+                risk_amt = krw_balance * (self.config.strategy.atr_position_risk_pct / 100.0)
+                risk_per_unit = abs(current_price - stop_loss)
+                if risk_per_unit > 0:
+                    order_size = risk_amt / risk_per_unit
+            except Exception:
+                order_size = None
+
         # Execute order with timeout and validation
-        # order_router.execute_signal은 내부에서 실시간 잔액을 100% 사용
+        # order_router.execute_signal은 내부에서 실시간 잔액을 100% 사용 (size=None)
         try:
             order_result = await asyncio.wait_for(
                 self.order_router.execute_signal(
                     signal=signal,
-                    size=None,  # order_router에서 실시간 잔액 조회 후 100% 사용
+                    size=order_size,  # None이면 100% 사용, 값 주면 해당 수량
                 ),
                 timeout=60.0  # 60 second timeout for order execution
             )

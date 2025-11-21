@@ -43,20 +43,27 @@ class StrategyConfig:
 
     # Scalping parameters
     entry_cooldown_seconds: int = 15
-    bb_width_min: float = 0.2
-    bb_width_max: float = 15.0
+    bb_width_min: float = 0.5
+    bb_width_max: float = 8.0
     time_stop_minutes: int = 5
     bb_pos_entry_max: float = 25.0
     volume_lookback: int = 20
-    volume_confirm_multiplier: float = 1.2
+    volume_confirm_multiplier: float = 1.5
     ema_slope_threshold: float = 0.15
     max_entries_per_hour: int = 6
+    trend_rsi_min: float = 60.0
+    trend_bb_pos_min: float = 60.0
+    trend_price_above_ema_pct: float = 0.3
+    trend_volume_multiplier: float = 2.0
+    use_atr_position_sizing: bool = False
+    atr_position_risk_pct: float = 1.0  # 계좌 대비 퍼센트 리스크
+    use_score_based_sizing: bool = False
     use_atr_sl_tp: bool = False
     atr_stop_multiplier: float = 0.5
     atr_target_multiplier: float = 1.0
-    min_expected_rr: float = 0.0
-    fee_rate_pct: float = 0.05
-    slippage_buffer_pct: float = 0.2
+    min_expected_rr: float = 0.5
+    fee_rate_pct: float = 0.10
+    slippage_buffer_pct: float = 0.25
 
     # Trading symbols
     symbols: List[str] = None
@@ -176,20 +183,27 @@ def load_config() -> TradingConfig:
         adx_period=int(os.getenv('ADX_PERIOD', '14')),
         atr_period=int(os.getenv('ATR_PERIOD', '14')),
         entry_cooldown_seconds=int(os.getenv('ENTRY_COOLDOWN_SECONDS', '15')),
-        bb_width_min=float(os.getenv('BB_WIDTH_MIN', '0.2')),
-        bb_width_max=float(os.getenv('BB_WIDTH_MAX', '15.0')),
+        bb_width_min=float(os.getenv('BB_WIDTH_MIN', '0.5')),
+        bb_width_max=float(os.getenv('BB_WIDTH_MAX', '8.0')),
         time_stop_minutes=int(os.getenv('TIME_STOP_MINUTES', '5')),
         bb_pos_entry_max=float(os.getenv('BB_POS_ENTRY_MAX', '25.0')),
         volume_lookback=int(os.getenv('VOLUME_LOOKBACK', '20')),
-        volume_confirm_multiplier=float(os.getenv('VOLUME_CONFIRM_MULTIPLIER', '1.2')),
+        volume_confirm_multiplier=float(os.getenv('VOLUME_CONFIRM_MULTIPLIER', '1.5')),
         ema_slope_threshold=float(os.getenv('EMA_SLOPE_THRESHOLD', '0.15')),
         max_entries_per_hour=int(os.getenv('MAX_ENTRIES_PER_HOUR', '6')),
+        trend_rsi_min=float(os.getenv('TREND_RSI_MIN', '60.0')),
+        trend_bb_pos_min=float(os.getenv('TREND_BB_POS_MIN', '60.0')),
+        trend_price_above_ema_pct=float(os.getenv('TREND_PRICE_ABOVE_EMA_PCT', '0.3')),
+        trend_volume_multiplier=float(os.getenv('TREND_VOLUME_MULTIPLIER', '2.0')),
+        use_atr_position_sizing=os.getenv('USE_ATR_POSITION_SIZING', 'false').lower() == 'true',
+        atr_position_risk_pct=float(os.getenv('ATR_POSITION_RISK_PCT', '1.0')),
+        use_score_based_sizing=os.getenv('USE_SCORE_BASED_SIZING', 'false').lower() == 'true',
         use_atr_sl_tp=os.getenv('USE_ATR_SLTP', 'false').lower() == 'true',
         atr_stop_multiplier=float(os.getenv('ATR_STOP_MULTIPLIER', '0.5')),
         atr_target_multiplier=float(os.getenv('ATR_TARGET_MULTIPLIER', '1.0')),
-        min_expected_rr=float(os.getenv('MIN_EXPECTED_RR', '0.0')),
-        fee_rate_pct=float(os.getenv('FEE_RATE_PCT', '0.05')),
-        slippage_buffer_pct=float(os.getenv('SLIPPAGE_BUFFER_PCT', '0.2')),
+        min_expected_rr=float(os.getenv('MIN_EXPECTED_RR', '0.5')),
+        fee_rate_pct=float(os.getenv('FEE_RATE_PCT', '0.10')),
+        slippage_buffer_pct=float(os.getenv('SLIPPAGE_BUFFER_PCT', '0.25')),
         symbols=symbols,
         timeframe=os.getenv('TIMEFRAME', '1m')
     )
@@ -292,6 +306,16 @@ def validate_strategy_config(config: StrategyConfig) -> None:
         errors.append(f"VOLUME_LOOKBACK must be >=1, got {config.volume_lookback}")
     if config.volume_confirm_multiplier < 0:
         errors.append(f"VOLUME_CONFIRM_MULTIPLIER must be >=0, got {config.volume_confirm_multiplier}")
+    if config.trend_bb_pos_min < -100 or config.trend_bb_pos_min > 100:
+        errors.append(f"TREND_BB_POS_MIN must be between -100~100, got {config.trend_bb_pos_min}")
+    if config.trend_rsi_min < 0 or config.trend_rsi_min > 100:
+        errors.append(f"TREND_RSI_MIN must be between 0~100, got {config.trend_rsi_min}")
+    if config.trend_volume_multiplier < 0:
+        errors.append(f"TREND_VOLUME_MULTIPLIER must be >=0, got {config.trend_volume_multiplier}")
+    if config.trend_price_above_ema_pct < 0:
+        errors.append(f"TREND_PRICE_ABOVE_EMA_PCT must be >=0, got {config.trend_price_above_ema_pct}")
+    if config.atr_position_risk_pct < 0 or config.atr_position_risk_pct > 100:
+        errors.append(f"ATR_POSITION_RISK_PCT must be between 0-100, got {config.atr_position_risk_pct}")
     if config.atr_stop_multiplier <= 0 or config.atr_target_multiplier <= 0:
         errors.append(f"ATR multipliers must be >0, got stop={config.atr_stop_multiplier}, target={config.atr_target_multiplier}")
     if config.min_expected_rr < 0:

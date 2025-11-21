@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Any
 import numpy as np
 
 from src.core.types import OHLCV, MarketRegime
-from src.indicators.indicators import calculate_ema
+from src.indicators.indicators import calculate_ema, calculate_adx
 from src.monitor.logger import logger
 
 
@@ -57,11 +57,13 @@ class FastRegimeDetector:
             logger.warning(f"[FastRegime] Insufficient candles: {len(candles)} < {need}")
             return MarketRegime.UNKNOWN, {}
 
-        # Extract close prices
+        # Extract prices
         try:
             close = [float(c.close) for c in candles]
+            high = [float(c.high) for c in candles]
+            low = [float(c.low) for c in candles]
         except Exception as e:
-            logger.warning(f"[FastRegime] Failed to extract close: {e}")
+            logger.warning(f"[FastRegime] Failed to extract OHLC: {e}")
             return MarketRegime.UNKNOWN, {}
 
         # Calculate EMAs
@@ -97,19 +99,42 @@ class FastRegimeDetector:
         except Exception:
             ema_slope_pct = 0.0
 
-        # Regime logic
-        regime = MarketRegime.RANGING
+        adx_val = None
+        plus_di_val = None
+        minus_di_val = None
+        try:
+            adx_arr, plus_di_arr, minus_di_arr = calculate_adx(high, low, close, period=14)
+            if len(adx_arr) > 0:
+                adx_val = float(adx_arr[-1])
+                plus_di_val = float(plus_di_arr[-1])
+                minus_di_val = float(minus_di_arr[-1])
+                if not math.isfinite(adx_val):
+                    adx_val = None
+        except Exception:
+            adx_val = None
 
-        # Strong trend signals
+        # Regime logic with ADX hint
+        regime = MarketRegime.RANGING
+        adx_strength = "unknown"
+        if adx_val is not None:
+            if adx_val < 20:
+                adx_strength = "weak"
+            elif adx_val < 25:
+                adx_strength = "mid"
+            elif adx_val < 35:
+                adx_strength = "strong"
+            else:
+                adx_strength = "very_strong"
+
         if current_ema_fast > current_ema_slow:
             # Bullish EMA alignment
-            if ema_div_pct >= self.ema_divergence_pct and current_price > current_ema_fast:
+            if ema_div_pct >= max(self.ema_divergence_pct, 0.7) and current_price > current_ema_fast and adx_val and adx_val >= 20:
                 regime = MarketRegime.UPTREND
             else:
                 regime = MarketRegime.RANGING
         elif current_ema_fast < current_ema_slow:
             # Bearish EMA alignment
-            if ema_div_pct >= self.ema_divergence_pct and current_price < current_ema_fast:
+            if ema_div_pct >= max(self.ema_divergence_pct, 0.7) and current_price < current_ema_fast and adx_val and adx_val >= 20:
                 regime = MarketRegime.DOWNTREND
             else:
                 regime = MarketRegime.RANGING
@@ -125,6 +150,10 @@ class FastRegimeDetector:
             "ema_divergence_pct": float(ema_div_pct),
             "ema_trend": 1 if current_ema_fast > current_ema_slow else -1,
             "ema_slope_pct": float(ema_slope_pct),
+            "adx": adx_val,
+            "plus_di": plus_di_val,
+            "minus_di": minus_di_val,
+            "adx_strength": adx_strength,
         }
 
         logger.debug(

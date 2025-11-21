@@ -58,6 +58,7 @@ class Signal:
     reason: str
     regime: MarketRegime
     indicators: dict  # RSI, BB, ADX, ATR values
+    score: Optional[float] = None
     executed: bool = False
 
 
