@@ -48,11 +48,17 @@ class OrderRouter:
         max_slippage_pct: float = 0.5,
         amount_precision: Optional[int] = None,
         price_precision: Optional[int] = None,
+        prefer_maker: bool = False,
+        maker_retry_seconds: float = 3.0,
+        maker_max_retries: int = 1,
     ):
         self.exchange = exchange
         self.default_order_type = default_order_type
         self.limit_order_timeout_seconds = limit_order_timeout_seconds
         self.max_slippage_pct = max_slippage_pct
+        self.prefer_maker = prefer_maker
+        self.maker_retry_seconds = maker_retry_seconds
+        self.maker_max_retries = maker_max_retries
 
         # precision은 항상 int or None
         self.amount_precision = self._norm_precision(
@@ -149,13 +155,29 @@ class OrderRouter:
                 OrderType.LIMIT.value if isinstance(self.default_order_type, OrderType) else "limit",
             )
 
-            if use_limit:
-                result = await self._execute_limit_order(
-                    symbol=signal.symbol,
-                    side=signal.side,
-                    size=size,
-                    limit_price=limit_price,
+            prefer_limit_first = use_limit or self.prefer_maker
+            result = None
+
+            if prefer_limit_first:
+                retries = self.maker_max_retries if self.prefer_maker else 0
+                attempt = 0
+                limit_timeout = self.limit_order_timeout_seconds if use_limit else min(
+                    self.limit_order_timeout_seconds, self.maker_retry_seconds
                 )
+                while attempt <= retries:
+                    result = await self._execute_limit_order(
+                        symbol=signal.symbol,
+                        side=signal.side,
+                        size=size,
+                        limit_price=limit_price,
+                        timeout_override=limit_timeout,
+                    )
+                    if result:
+                        break
+                    attempt += 1
+                    if attempt <= retries and self.prefer_maker:
+                        await asyncio.sleep(self.maker_retry_seconds)
+
                 if result is None:
                     logger.warning(
                         "Limit path failed for %s, attempting market fallback",
@@ -242,7 +264,7 @@ class OrderRouter:
         """
         Close an existing position via market order (fast exit).
         
-        자동으로 실시간 잔액의 100%를 매도합니다.
+        size>0 로 주면 해당 수량만 청산, size<=0 또는 None이면 실시간 잔액 100% 사용.
 
         Args:
             symbol: Trading symbol
@@ -266,7 +288,7 @@ class OrderRouter:
             return await self._execute_market_order(
                 symbol=symbol,
                 side=close_side,
-                size=0,  # Marker value; _execute_market_order에서 실시간 잔액 100% 사용
+                size=size,
             )
         except Exception as e:
             logger.error("Failed to close position for %s: %s", symbol, e)
@@ -461,6 +483,7 @@ class OrderRouter:
         For BUY: Uses 100% available KRW balance
         For SELL: Uses 100% available base currency
         """
+        amount_override = size if size is not None and size > 0 else None
         # 실시간 잔액 조회
         try:
             balance = await self.exchange.fetch_balance()
@@ -481,35 +504,50 @@ class OrderRouter:
         
         # 잔액 파싱 (Upbit CCXT format)
         if side == OrderSide.BUY:
-            # KRW 잔액으로 100% 매수
-            krw_balance = self._extract_krw_balance(balance)
-            if krw_balance <= 0:
-                logger.error(f"[{symbol}] 매수 잔액 부족: KRW {krw_balance}")
-                return None
-            
-            # 매수 수량 = KRW 잔액 / 현재가 (100% 사용)
-            size = krw_balance / current_price
-            
+            krw_balance = self._extract_krw_free_balance(balance)
+            if amount_override is None:
+                # KRW 잔액으로 100% 매수 (가용액 free 기준)
+                if krw_balance <= 0:
+                    logger.error(f"[{symbol}] 매수 잔액 부족: KRW {krw_balance}")
+                    return None
+                
+                # 매수 수량 = KRW 잔액 / 현재가 (100% 사용)
+                size = krw_balance / current_price
+            else:
+                size = amount_override
+
         elif side == OrderSide.SELL:
-            # 기본 통화(XRP 등) 잔액으로 100% 매도
-            base_currency = symbol.split('/')[0]  # XRP/KRW -> XRP
-            base_balance = self._extract_base_balance(balance, base_currency)
-            if base_balance <= 0:
-                logger.error(f"[{symbol}] 매도 잔액 부족: {base_currency} {base_balance}")
-                return None
-            
-            size = base_balance
+            if amount_override is None:
+                # 기본 통화(XRP 등) 잔액으로 100% 매도
+                base_currency = symbol.split('/')[0]  # XRP/KRW -> XRP
+                base_balance = self._extract_base_balance(balance, base_currency)
+                if base_balance <= 0:
+                    logger.error(f"[{symbol}] 매도 잔액 부족: {base_currency} {base_balance}")
+                    return None
+                
+                size = base_balance
+            else:
+                size = amount_override
         
         # Upbit 시장가 매수: amount는 코인 수량이 아니라 사용할 KRW 금액!
         if side == OrderSide.BUY:
-            # BUY: KRW 잔액을 직접 사용 (부동소수점 오류 방지)
-            # round_to_precision으로 정수로 만들되, 여유 1% 감소 (수수료/슬리피지 대비)
-            order_amount = krw_balance * 0.99  # 1% 여유 확보
-            order_amount = round_to_precision(order_amount, 0)  # KRW는 정수
-            if order_amount <= 0:
-                logger.error(f"[{symbol}] 100% 잔액 계산 후 주문 금액 부족: {order_amount}")
+            # BUY: KRW 가용액을 직접 사용 (부동소수점 오류 방지)
+            if amount_override is None:
+                # 슬리피지/수수료 대비 5% 여유 (가용액 불일치 대비)
+                order_cost = krw_balance * 0.95
+                order_amount = round_to_precision(order_cost / current_price, self.amount_precision)
+            else:
+                order_amount = round_to_precision(amount_override, self.amount_precision)
+                order_cost = order_amount * current_price
+
+            order_cost = round_to_precision(order_cost, 0)  # KRW는 정수
+            if order_cost <= 0:
+                logger.error(f"[{symbol}] 100% 잔액 계산 후 주문 금액 부족: {order_cost}")
                 return None
-            logger.info(f"시장가 주문 (100% 잔액): {side.value} {order_amount:.0f} KRW → {symbol}")
+            logger.info(
+                f"시장가 주문 (100% 잔액): {side.value} {order_amount:.8f} {symbol} "
+                f"~ {order_cost:.0f} KRW (가용 KRW={krw_balance:.0f})"
+            )
         else:
             # SELL: size는 코인 수량
             size = round_to_precision(size, self.amount_precision)
@@ -604,23 +642,17 @@ class OrderRouter:
             )
             return None
     
-    def _extract_krw_balance(self, balance: Dict) -> float:
-        """Upbit 잔액에서 KRW 금액 추출 (사용 가능한 금액만)."""
+    def _extract_krw_free_balance(self, balance: Dict) -> float:
+        """Upbit 잔액에서 KRW 가용액(free)만 추출."""
         try:
             if isinstance(balance, dict):
-                # CCXT format: balance['KRW']['free'] (사용 가능한 금액)
                 if 'KRW' in balance and isinstance(balance['KRW'], dict):
-                    free = float(balance['KRW'].get('free', 0.0))
-                    if free > 0:
-                        return free
-                # Alternative format: balance['total']['KRW']
-                if 'total' in balance and isinstance(balance['total'], dict):
-                    total = float(balance['total'].get('KRW', 0.0))
-                    if total > 0:
-                        return total
+                    return float(balance['KRW'].get('free', 0.0) or 0.0)
+                if 'free' in balance and isinstance(balance['free'], dict):
+                    return float(balance['free'].get('KRW', 0.0) or 0.0)
             return 0.0
         except Exception as e:
-            logger.error(f"Failed to extract KRW balance: {e}")
+            logger.error(f"Failed to extract KRW free balance: {e}")
             return 0.0
     
     def _extract_base_balance(self, balance: Dict, base_currency: str) -> float:

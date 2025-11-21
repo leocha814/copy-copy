@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
+import statistics
 
 from src.core.types import OHLCV, MarketRegime, OrderSide, Signal
 from src.core.time_utils import now_utc
@@ -97,6 +98,9 @@ class ScalpingStrategy:
         # Fixed stops (percentage) - IMPROVED
         fixed_stop_loss_pct: float = 0.20,  # Increased from 0.15
         fixed_take_profit_pct: float = 0.35,  # Increased from 0.25
+        use_atr_sl_tp: bool = False,
+        atr_stop_multiplier: float = 0.5,
+        atr_target_multiplier: float = 1.0,
         # Downtrend bounce scalping (tighter stops)
         downtrend_stop_loss_pct: float = 0.15,  # NEW: Tighter SL for counter-trend
         downtrend_take_profit_pct: float = 0.20,  # NEW: Faster TP for bounces
@@ -105,6 +109,15 @@ class ScalpingStrategy:
         enable_uptrend_longs: bool = True,
         enable_downtrend_bounce_longs: bool = True,  # NEW: Renamed from shorts
         enable_ranging_both: bool = True,
+        # Entry filters
+        bb_pos_entry_max: float = 25.0,
+        volume_lookback: int = 20,
+        volume_confirm_multiplier: float = 1.2,
+        ema_slope_threshold: float = 0.15,
+        # Profit filter
+        min_expected_rr: float = 0.0,
+        fee_rate_pct: float = 0.05,
+        slippage_buffer_pct: float = 0.2,
     ):
         self.rsi_period = rsi_period
         self.rsi_entry_low = rsi_entry_low
@@ -123,6 +136,9 @@ class ScalpingStrategy:
 
         self.fixed_stop_loss_pct = fixed_stop_loss_pct
         self.fixed_take_profit_pct = fixed_take_profit_pct
+        self.use_atr_sl_tp = use_atr_sl_tp
+        self.atr_stop_multiplier = atr_stop_multiplier
+        self.atr_target_multiplier = atr_target_multiplier
         self.downtrend_stop_loss_pct = downtrend_stop_loss_pct
         self.downtrend_take_profit_pct = downtrend_take_profit_pct
         self.time_stop_minutes = time_stop_minutes
@@ -130,6 +146,14 @@ class ScalpingStrategy:
         self.enable_uptrend_longs = enable_uptrend_longs
         self.enable_downtrend_bounce_longs = enable_downtrend_bounce_longs
         self.enable_ranging_both = enable_ranging_both
+
+        self.bb_pos_entry_max = bb_pos_entry_max
+        self.volume_lookback = volume_lookback
+        self.volume_confirm_multiplier = volume_confirm_multiplier
+        self.ema_slope_threshold = ema_slope_threshold
+        self.min_expected_rr = min_expected_rr
+        self.fee_rate_pct = fee_rate_pct
+        self.slippage_buffer_pct = slippage_buffer_pct
 
         # Track last signal time per symbol
         self.last_signal_time: Dict[str, datetime] = {}
@@ -257,6 +281,7 @@ class ScalpingStrategy:
         candles: List[OHLCV],
         regime: MarketRegime,
         symbol: str,
+        regime_ctx: Optional[Dict[str, Any]] = None,
     ) -> Optional[Signal]:
         """
         Generate scalping entry signal based on regime.
@@ -281,9 +306,10 @@ class ScalpingStrategy:
                 )
                 return None
 
-        # Extract prices
+        # Extract prices / volume
         try:
             close_prices = [float(c.close) for c in candles]
+            volumes = [float(c.volume) for c in candles]
         except Exception:
             return None
 
@@ -305,6 +331,34 @@ class ScalpingStrategy:
         ema_fast = ind["ema_fast"]
         ema_slow = ind["ema_slow"]
         ema_trend = ind["ema_trend"]
+
+        # Entry guard: 깊은 밴드 + RSI 범위
+        if bb_position is None or bb_position > self.bb_pos_entry_max:
+            logger.debug(f"[{symbol}] BB 포지션 진입 범위 밖: {bb_position}")
+            return None
+        if not (self.rsi_entry_low <= rsi <= self.rsi_entry_high):
+            logger.debug(f"[{symbol}] RSI 진입 범위 밖: {rsi:.1f}")
+            return None
+
+        # 거래량 확인: 최근 거래량이 평균 대비 충분히 높을 때만 진입
+        vol_confirmed = True
+        if len(volumes) >= self.volume_lookback:
+            recent_vol = volumes[-1]
+            base_vol = statistics.mean(volumes[-self.volume_lookback : -1])
+            if base_vol > 0:
+                vol_confirmed = recent_vol >= base_vol * self.volume_confirm_multiplier
+        if not vol_confirmed:
+            logger.debug(f"[{symbol}] 거래량 부족: 최근<{self.volume_confirm_multiplier}x 평균")
+            return None
+
+        # 급한 기울기에서는 횡보 역추세 진입 차단
+        if (
+            regime == MarketRegime.RANGING
+            and regime_ctx is not None
+            and abs(regime_ctx.get("ema_slope_pct", 0.0)) >= self.ema_slope_threshold
+        ):
+            logger.debug(f"[{symbol}] EMA 기울기 과도 -> 횡보 역추세 진입 차단")
+            return None
 
         # BB width filter
         if bb_width_pct < self.bb_width_min:
@@ -544,3 +598,48 @@ class ScalpingStrategy:
             take_profit = entry_price * (1 - self.fixed_take_profit_pct / 100.0)
 
         return stop_loss, take_profit
+
+    def get_stops(
+        self,
+        entry_price: float,
+        entry_side: OrderSide,
+        atr_value: float,
+    ) -> Tuple[float, float]:
+        """ATR 기반 또는 고정 퍼센트 기반 SL/TP 계산."""
+        if self.use_atr_sl_tp and atr_value > 0 and entry_price > 0:
+            atr_pct = (atr_value / entry_price) * 100.0
+            sl_pct = max(0.05, atr_pct * self.atr_stop_multiplier)
+            tp_pct = max(sl_pct * 1.5, atr_pct * self.atr_target_multiplier)
+            if entry_side == OrderSide.BUY:
+                stop_loss = entry_price * (1 - sl_pct / 100.0)
+                take_profit = entry_price * (1 + tp_pct / 100.0)
+            else:
+                stop_loss = entry_price * (1 + sl_pct / 100.0)
+                take_profit = entry_price * (1 - tp_pct / 100.0)
+            return stop_loss, take_profit
+        return self.get_fixed_stops(entry_price, entry_side)
+
+    def passes_profitability_check(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> bool:
+        """예상 수익폭이 수수료/슬리피지 버퍼 대비 충분한지 확인."""
+        if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            return False
+        reward_pct = ((take_profit / entry_price) - 1.0) * 100.0
+        risk_pct = (1.0 - (stop_loss / entry_price)) * 100.0
+        if reward_pct <= 0 or risk_pct <= 0:
+            return False
+
+        fee_round_trip = self.fee_rate_pct * 2.0
+        buffer = fee_round_trip + self.slippage_buffer_pct
+        net_reward = reward_pct - buffer
+
+        if net_reward <= 0:
+            return False
+        if self.min_expected_rr > 0:
+            rr = net_reward / risk_pct
+            return rr >= self.min_expected_rr
+        return True

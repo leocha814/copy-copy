@@ -76,8 +76,8 @@ class ScalpingBot:
 
         self.scalping_strategy = ScalpingStrategy(
             rsi_period=self.config.strategy.rsi_period,
-            rsi_entry_low=self.config.strategy.rsi_oversold,
-            rsi_entry_high=self.config.strategy.rsi_overbought,
+            rsi_entry_low=self.config.strategy.rsi_entry_low,
+            rsi_entry_high=self.config.strategy.rsi_entry_high,
             rsi_exit_neutral=self.config.strategy.rsi_exit_neutral,
             rsi_oversold=30.0,  # Fixed for downtrend bounce detection
             rsi_overbought=70.0,  # Fixed for overbought exit
@@ -90,12 +90,22 @@ class ScalpingBot:
             bb_width_max=self.config.strategy.bb_width_max,
             fixed_stop_loss_pct=self.config.risk.fixed_stop_loss_pct,
             fixed_take_profit_pct=self.config.risk.fixed_take_profit_pct,
+            use_atr_sl_tp=self.config.strategy.use_atr_sl_tp,
+            atr_stop_multiplier=self.config.strategy.atr_stop_multiplier,
+            atr_target_multiplier=self.config.strategy.atr_target_multiplier,
             downtrend_stop_loss_pct=self.config.risk.downtrend_stop_loss_pct,
             downtrend_take_profit_pct=self.config.risk.downtrend_take_profit_pct,
             time_stop_minutes=self.config.strategy.time_stop_minutes,
             enable_uptrend_longs=True,
             enable_downtrend_bounce_longs=True,  # Changed from shorts to bounce longs
             enable_ranging_both=True,
+            bb_pos_entry_max=self.config.strategy.bb_pos_entry_max,
+            volume_lookback=self.config.strategy.volume_lookback,
+            volume_confirm_multiplier=self.config.strategy.volume_confirm_multiplier,
+            ema_slope_threshold=self.config.strategy.ema_slope_threshold,
+            min_expected_rr=self.config.strategy.min_expected_rr,
+            fee_rate_pct=self.config.strategy.fee_rate_pct,
+            slippage_buffer_pct=self.config.strategy.slippage_buffer_pct,
         )
 
         limits = RiskLimits(
@@ -112,6 +122,9 @@ class ScalpingBot:
             default_order_type=self.config.execution.default_order_type,
             limit_order_timeout_seconds=self.config.execution.limit_order_timeout_seconds,
             max_slippage_pct=self.config.execution.max_slippage_pct,
+            prefer_maker=self.config.execution.prefer_maker,
+            maker_retry_seconds=self.config.execution.maker_retry_seconds,
+            maker_max_retries=self.config.execution.maker_max_retries,
         )
 
         self.position_tracker = PositionTracker()
@@ -140,6 +153,8 @@ class ScalpingBot:
         self.consecutive_losses = 0
         self.peak_balance = 0.0
         self.session_start_balance = 0.0
+        self.entry_history: Dict[str, list] = {}
+        self.symbol_cooldowns: Dict[str, datetime] = {}
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
@@ -366,7 +381,7 @@ class ScalpingBot:
             await self._manage_position(symbol, position, candles, regime)
         else:
             # Look for entry signal
-            await self._check_entry(symbol, regime, candles)
+            await self._check_entry(symbol, regime, candles, regime_ctx)
 
     async def _emergency_liquidate(self, symbol: str, position, reason: str):
         """긴급 청산 (서버 시작 시 손절/익절 도달했을 때)."""
@@ -522,8 +537,27 @@ class ScalpingBot:
             except Exception as e:
                 logger.warning(f"[{symbol}] 기존 포지션 확인 실패: {e}")
 
-    async def _check_entry(self, symbol: str, regime: MarketRegime, candles):
+    async def _check_entry(self, symbol: str, regime: MarketRegime, candles, regime_ctx):
         """Check for entry signal and execute if found."""
+        now_ts = datetime.now(timezone.utc)
+
+        # 심볼 쿨다운 및 시간당 횟수 제한
+        last_entry = self.symbol_cooldowns.get(symbol)
+        if last_entry:
+            elapsed = (now_ts - last_entry).total_seconds()
+            if elapsed < self.config.strategy.entry_cooldown_seconds:
+                logger.debug(f"[{symbol}] 심볼 쿨다운 진행 중: {elapsed:.0f}s")
+                return
+
+        history = self.entry_history.get(symbol, [])
+        recent = [ts for ts in history if (now_ts - ts).total_seconds() < 3600]
+        if len(recent) >= self.config.strategy.max_entries_per_hour:
+            logger.debug(
+                f"[{symbol}] 시간당 진입 한도 초과: {len(recent)} / {self.config.strategy.max_entries_per_hour}"
+            )
+            self.entry_history[symbol] = recent  # cleanup
+            return
+
         # 주문할 돈이 없으면 진입 스킵
         try:
             balance_raw = await asyncio.wait_for(
@@ -555,6 +589,7 @@ class ScalpingBot:
             candles=candles,
             regime=regime,
             symbol=symbol,
+            regime_ctx=regime_ctx,
         )
 
         if not signal:
@@ -602,23 +637,24 @@ class ScalpingBot:
 
         current_price = float(candles[-1].close)
 
-        # Use fixed stops if enabled
-        if self.config.risk.use_fixed_stops:
-            stop_loss, take_profit = self.scalping_strategy.get_fixed_stops(
-                entry_price=current_price,
-                entry_side=signal.side,
-            )
-        else:
-            atr_value = self._estimate_atr(candles, period=self.config.strategy.atr_period)
-            if atr_value <= 0:
-                atr_value = current_price * 0.01  # 기본 1% fallback
-            stop_loss, take_profit = self.risk_manager.calculate_stop_loss_take_profit(
-                entry_price=current_price,
-                side=signal.side,
-                atr_value=atr_value,
-                stop_atr_multiplier=self.config.risk.stop_atr_multiplier,
-                target_atr_multiplier=self.config.risk.target_atr_multiplier,
-            )
+        # SL/TP 산출 (ATR 옵션 포함)
+        atr_value = self._estimate_atr(candles, period=self.config.strategy.atr_period)
+        if atr_value <= 0:
+            atr_value = current_price * 0.01  # 기본 fallback
+        stop_loss, take_profit = self.scalping_strategy.get_stops(
+            entry_price=current_price,
+            entry_side=signal.side,
+            atr_value=atr_value,
+        )
+
+        # 사전 수익성 체크
+        if not self.scalping_strategy.passes_profitability_check(
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        ):
+            logger.debug(f"[{symbol}] 예상 수익성 부족 - 진입 스킵")
+            return
 
         logger.info(
             f"[{symbol}] 손절: {stop_loss:.2f} | 익절: {take_profit:.2f}"
@@ -677,6 +713,10 @@ class ScalpingBot:
             take_profit=take_profit,
         )
 
+        # 쿨다운 / 횟수 상태 업데이트 (실제 체결 후)
+        self.symbol_cooldowns[symbol] = now_ts
+        self.entry_history.setdefault(symbol, []).append(now_ts)
+
         logger.info(f"[{symbol}] ✅ 포지션 오픈: {signal.side.value} {position_size:.8f} @ {entry_price:.2f}")
 
         if self.alerts:
@@ -702,6 +742,7 @@ class ScalpingBot:
 
     async def _manage_position(self, symbol: str, position, candles, regime: MarketRegime):
         """Manage existing position (check exit conditions)."""
+        original_position_size = position.size
         # Check if should exit (with regime for improved logic)
         should_exit, exit_reason = self.scalping_strategy.should_exit(
             candles=candles,
@@ -867,20 +908,11 @@ class ScalpingBot:
 
             pnl = trade.pnl
             
-            # 부분 청산 후 position 참조 검증
             updated_position = self.position_tracker.get_position(symbol)
-            if updated_position is None and filled_amount >= position.size:
-                # 전체 청산된 경우: 정상 (position 삭제됨)
+            if updated_position is None and filled_amount >= original_position_size:
                 logger.info(f"[{symbol}] ✓ 포지션 완전 삭제됨 (전체 청산 완료)")
-            elif updated_position is not None and filled_amount < position.size:
-                # 부분 청산된 경우: position 남아있어야 함
-                logger.info(f"[{symbol}] ✓ 포지션 부분 유지됨 (남은 수량: {updated_position.size:.8f})")
-            elif updated_position is None and filled_amount < position.size:
-                # 에러: 부분 청산인데 position이 삭제됨
-                logger.error(f"[{symbol}] ✗ 포지션 참조 오류: 부분 청산인데 position이 삭제됨 (filled={filled_amount}, size={position.size})")
-            elif updated_position is not None and filled_amount >= position.size:
-                # 에러: 전체 청산인데 position이 남아있음
-                logger.error(f"[{symbol}] ✗ 포지션 참조 오류: 전체 청산인데 position이 남아있음 (filled={filled_amount}, remaining={updated_position.size})")
+            elif updated_position is not None and filled_amount < original_position_size:
+                logger.error(f"[{symbol}] ✗ 포지션 참조 오류: 일부만 청산됨 (filled={filled_amount}, target={original_position_size})")
 
             # Update daily PnL and consecutive losses
             self.daily_pnl += pnl
@@ -1012,12 +1044,22 @@ class ScalpingBot:
 
     def _log_summary(self, account_state: AccountState):
         """Log account summary for this iteration."""
+        # 현재 오픈 포지션(있으면 1개) 정보 표시
+        positions = self.position_tracker.get_all_positions()
+        pos = positions[0] if positions else None
+        if pos:
+            entry_str = f"{pos.entry_price:,.0f}"
+            sl_str = f"{pos.stop_loss:,.0f}" if pos.stop_loss else "-"
+            tp_str = f"{pos.take_profit:,.0f}" if pos.take_profit else "-"
+            current_str = f"{pos.current_price:,.0f}" if pos.current_price else "-"
+        else:
+            entry_str = sl_str = tp_str = current_str = "-"
+
         logger.info(
             f"📊 계정 요약: 잔고={account_state.total_balance:,.0f} KRW | "
-            f"자산={account_state.equity:,.0f} KRW | "
-            f"미실현손익={(account_state.equity - account_state.total_balance):+,.0f} KRW | "
             f"일간손익={self.daily_pnl:+,.0f} KRW | "
-            f"낙폭={account_state.current_drawdown_pct:.2f}%"
+            f"현재가={current_str} | "
+            f"구매가={entry_str} | 손절={sl_str} | 익절={tp_str}"
         )
 
 

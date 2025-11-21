@@ -87,6 +87,15 @@ class FastRegimeDetector:
             return MarketRegime.UNKNOWN, {}
 
         ema_div_pct = abs((current_ema_fast - current_ema_slow) / current_ema_slow) * 100.0
+        ema_slope_pct = 0.0
+        try:
+            # 최근 3캔들 전 EMA_fast와 비교한 % 기울기
+            if len(ema_fast) >= 4:
+                past = float(ema_fast[-4])
+                if past != 0:
+                    ema_slope_pct = ((current_ema_fast - past) / past) * 100.0
+        except Exception:
+            ema_slope_pct = 0.0
 
         # Regime logic
         regime = MarketRegime.RANGING
@@ -115,6 +124,7 @@ class FastRegimeDetector:
             "price": float(current_price),
             "ema_divergence_pct": float(ema_div_pct),
             "ema_trend": 1 if current_ema_fast > current_ema_slow else -1,
+            "ema_slope_pct": float(ema_slope_pct),
         }
 
         logger.debug(

@@ -28,6 +28,8 @@ class StrategyConfig:
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
     rsi_exit_neutral: float = 50.0
+    rsi_entry_low: float = 35.0
+    rsi_entry_high: float = 65.0
 
     # Bollinger Bands parameters
     bb_period: int = 20
@@ -44,6 +46,17 @@ class StrategyConfig:
     bb_width_min: float = 0.2
     bb_width_max: float = 15.0
     time_stop_minutes: int = 5
+    bb_pos_entry_max: float = 25.0
+    volume_lookback: int = 20
+    volume_confirm_multiplier: float = 1.2
+    ema_slope_threshold: float = 0.15
+    max_entries_per_hour: int = 6
+    use_atr_sl_tp: bool = False
+    atr_stop_multiplier: float = 0.5
+    atr_target_multiplier: float = 1.0
+    min_expected_rr: float = 0.0
+    fee_rate_pct: float = 0.05
+    slippage_buffer_pct: float = 0.2
 
     # Trading symbols
     symbols: List[str] = None
@@ -81,6 +94,9 @@ class ExecutionConfig:
     max_slippage_pct: float = 0.5
     amount_precision: int = 8
     price_precision: int = 2
+    prefer_maker: bool = False
+    maker_retry_seconds: float = 3.0
+    maker_max_retries: int = 1
 
 
 @dataclass
@@ -151,6 +167,8 @@ def load_config() -> TradingConfig:
         rsi_oversold=float(os.getenv('RSI_OVERSOLD', '35')),
         rsi_overbought=float(os.getenv('RSI_OVERBOUGHT', '65')),
         rsi_exit_neutral=float(os.getenv('RSI_EXIT_NEUTRAL', '50')),
+        rsi_entry_low=float(os.getenv('RSI_ENTRY_LOW', '35')),
+        rsi_entry_high=float(os.getenv('RSI_ENTRY_HIGH', '65')),
         bb_period=int(os.getenv('BB_PERIOD', '20')),
         bb_std_dev=float(os.getenv('BB_STD_DEV', '2.0')),
         adx_threshold_low=float(os.getenv('ADX_THRESHOLD_LOW', '20')),
@@ -161,6 +179,17 @@ def load_config() -> TradingConfig:
         bb_width_min=float(os.getenv('BB_WIDTH_MIN', '0.2')),
         bb_width_max=float(os.getenv('BB_WIDTH_MAX', '15.0')),
         time_stop_minutes=int(os.getenv('TIME_STOP_MINUTES', '5')),
+        bb_pos_entry_max=float(os.getenv('BB_POS_ENTRY_MAX', '25.0')),
+        volume_lookback=int(os.getenv('VOLUME_LOOKBACK', '20')),
+        volume_confirm_multiplier=float(os.getenv('VOLUME_CONFIRM_MULTIPLIER', '1.2')),
+        ema_slope_threshold=float(os.getenv('EMA_SLOPE_THRESHOLD', '0.15')),
+        max_entries_per_hour=int(os.getenv('MAX_ENTRIES_PER_HOUR', '6')),
+        use_atr_sl_tp=os.getenv('USE_ATR_SLTP', 'false').lower() == 'true',
+        atr_stop_multiplier=float(os.getenv('ATR_STOP_MULTIPLIER', '0.5')),
+        atr_target_multiplier=float(os.getenv('ATR_TARGET_MULTIPLIER', '1.0')),
+        min_expected_rr=float(os.getenv('MIN_EXPECTED_RR', '0.0')),
+        fee_rate_pct=float(os.getenv('FEE_RATE_PCT', '0.05')),
+        slippage_buffer_pct=float(os.getenv('SLIPPAGE_BUFFER_PCT', '0.2')),
         symbols=symbols,
         timeframe=os.getenv('TIMEFRAME', '1m')
     )
@@ -187,7 +216,10 @@ def load_config() -> TradingConfig:
         limit_order_timeout_seconds=float(os.getenv('LIMIT_ORDER_TIMEOUT_SECONDS', '30.0')),
         max_slippage_pct=float(os.getenv('MAX_SLIPPAGE_PCT', '0.5')),
         amount_precision=int(os.getenv('AMOUNT_PRECISION', '8')),
-        price_precision=int(os.getenv('PRICE_PRECISION', '2'))
+        price_precision=int(os.getenv('PRICE_PRECISION', '2')),
+        prefer_maker=os.getenv('PREFER_MAKER', 'false').lower() == 'true',
+        maker_retry_seconds=float(os.getenv('MAKER_RETRY_SECONDS', '3.0')),
+        maker_max_retries=int(os.getenv('MAKER_MAX_RETRIES', '1')),
     )
 
     # Telegram config
@@ -246,12 +278,24 @@ def validate_strategy_config(config: StrategyConfig) -> None:
         errors.append(f"RSI_OVERBOUGHT must be between 0-100, got {config.rsi_overbought}")
     if config.rsi_oversold >= config.rsi_overbought:
         errors.append(f"RSI_OVERSOLD ({config.rsi_oversold}) must be < RSI_OVERBOUGHT ({config.rsi_overbought})")
+    if config.rsi_entry_low > config.rsi_entry_high:
+        errors.append(f"RSI_ENTRY_LOW ({config.rsi_entry_low}) must be <= RSI_ENTRY_HIGH ({config.rsi_entry_high})")
     
     # Bollinger Bands validation
     if not (2 <= config.bb_period <= 200):
         errors.append(f"BB_PERIOD must be between 2-200, got {config.bb_period}")
     if not (0.1 <= config.bb_std_dev <= 5.0):
         errors.append(f"BB_STD_DEV must be between 0.1-5.0, got {config.bb_std_dev}")
+    if not (-100.0 <= config.bb_pos_entry_max <= 100.0):
+        errors.append(f"BB_POS_ENTRY_MAX must be between -100~100, got {config.bb_pos_entry_max}")
+    if config.volume_lookback < 1:
+        errors.append(f"VOLUME_LOOKBACK must be >=1, got {config.volume_lookback}")
+    if config.volume_confirm_multiplier < 0:
+        errors.append(f"VOLUME_CONFIRM_MULTIPLIER must be >=0, got {config.volume_confirm_multiplier}")
+    if config.atr_stop_multiplier <= 0 or config.atr_target_multiplier <= 0:
+        errors.append(f"ATR multipliers must be >0, got stop={config.atr_stop_multiplier}, target={config.atr_target_multiplier}")
+    if config.min_expected_rr < 0:
+        errors.append(f"MIN_EXPECTED_RR must be >=0, got {config.min_expected_rr}")
     
     # ADX/ATR validation
     if not (1 <= config.adx_period <= 100):
